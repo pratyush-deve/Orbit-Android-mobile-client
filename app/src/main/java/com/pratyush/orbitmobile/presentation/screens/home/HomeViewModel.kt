@@ -51,7 +51,8 @@ class HomeViewModel(
     private val context: Context,
     private val controlsRepository: ControlsRepository? = null,
     private val firebasePresenceManager: FirebasePresenceManager? = null,
-    private val remoteLinkStore: RemoteLinkStore? = null
+    private val remoteLinkStore: RemoteLinkStore? = null,
+    private val clipboardSyncCoordinator: com.pratyush.orbitmobile.core.firebase.ClipboardSyncCoordinator? = null
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -59,6 +60,12 @@ class HomeViewModel(
 
     private val clipboardManager by lazy {
         context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    }
+
+    private val loopGuard by lazy {
+        com.pratyush.orbitmobile.core.firebase.ClipboardLoopGuard(
+            persistenceFile = java.io.File(context.filesDir, "orbit_clipboard_loop_guard.json")
+        )
     }
 
     // Echo prevention: track what we've sent and what was copied from Windows
@@ -77,16 +84,42 @@ class HomeViewModel(
         loadPreferences()
         observeConnectionStatus()
         observeClipboardHistory()
+        observePendingRemoteClipboard()
+    }
+
+    private fun observePendingRemoteClipboard() {
+        clipboardSyncCoordinator?.pendingClipboard
+            ?.onEach { pending ->
+                _uiState.update { it.copy(hasPendingRemoteClipboard = pending != null) }
+            }
+            ?.launchIn(viewModelScope)
+    }
+
+    fun applyPendingRemoteClipboard() {
+        if (clipboardSyncCoordinator?.applyPendingClipboard() == true) {
+            _uiState.update { it.copy(lastActionFeedback = "Copied PC clipboard to device!") }
+        }
     }
 
     private fun loadPreferences() {
-        viewModelScope.launch {
-            try {
-                val config = preferencesManager.appConfig.first()
+        preferencesManager.appConfig
+            .onEach { config ->
                 _uiState.update { it.copy(isClipboardSyncActive = config.isClipboardSyncEnabled) }
-            } catch (e: Exception) {
-                Log.w("HomeVM", "Failed to load preferences: ${e.message}")
+                reconcileLegacyClipboardListener()
             }
+            .launchIn(viewModelScope)
+    }
+
+    private fun reconcileLegacyClipboardListener() {
+        // When ClipboardSyncCoordinator is present, it owns the global foreground listener.
+        if (clipboardSyncCoordinator != null) {
+            unregisterClipboardListener()
+            return
+        }
+        if (_uiState.value.isClipboardSyncActive && _uiState.value.effectiveConnectionState.isConnected) {
+            registerClipboardListener()
+        } else {
+            unregisterClipboardListener()
         }
     }
 
@@ -125,16 +158,11 @@ class HomeViewModel(
                         lastKnownDeviceName = resolvedDeviceName
                     )
                 }
-                if (status is ConnectionState.Connected) {
-                    if (_uiState.value.isClipboardSyncActive) {
-                        registerClipboardListener()
-                    }
-                    // Inform Windows of current clipboard sync preference
+                reconcileLegacyClipboardListener()
+                if (_uiState.value.effectiveConnectionState.isConnected && status is ConnectionState.Connected) {
                     viewModelScope.launch {
                         connectionRepository.updateClipboardSyncState(_uiState.value.isClipboardSyncActive)
                     }
-                } else {
-                    unregisterClipboardListener()
                 }
             }
             .launchIn(viewModelScope)
@@ -226,18 +254,23 @@ class HomeViewModel(
             }
             is HomeAction.AppResumed -> {
                 // Foreground lifecycle refresh: trigger fresh telemetry snapshot, controls, and clipboard
-                val state = _uiState.value.connectionState
-                if (state is ConnectionState.Connected) {
+                val effectiveState = _uiState.value.effectiveConnectionState
+                val isLan = _uiState.value.connectionState is ConnectionState.Connected
+                if (isLan) {
                     OrbitBackgroundService.requestImmediateTelemetry(context)
                     viewModelScope.launch {
                         controlsRepository?.refreshControlsStatus()
                     }
                 }
-                if (_uiState.value.isClipboardSyncActive && state is ConnectionState.Connected) {
-                    registerClipboardListener()
-                    checkAndSyncNewPhoneClipboardOnly()
-                    viewModelScope.launch {
-                        connectionRepository.refreshClipboardHistoryFromPc()
+                if (_uiState.value.isClipboardSyncActive && effectiveState.isConnected) {
+                    reconcileLegacyClipboardListener()
+                    if (clipboardSyncCoordinator == null) {
+                        checkAndSyncNewPhoneClipboardOnly()
+                    }
+                    if (isLan) {
+                        viewModelScope.launch {
+                            connectionRepository.refreshClipboardHistoryFromPc()
+                        }
                     }
                 }
             }
@@ -248,11 +281,9 @@ class HomeViewModel(
                     preferencesManager.setClipboardSync(enabled)
                     connectionRepository.updateClipboardSyncState(enabled)
                 }
-                if (enabled) {
-                    registerClipboardListener()
+                reconcileLegacyClipboardListener()
+                if (enabled && clipboardSyncCoordinator == null) {
                     syncClipboardAuto()
-                } else {
-                    unregisterClipboardListener()
                 }
             }
             is HomeAction.SyncClipboardNow -> {
@@ -304,6 +335,10 @@ class HomeViewModel(
 
                 _uiState.update { it.copy(currentClipText = text) }
 
+                if (!_uiState.value.isClipboardSyncActive) return@launch
+                if (!com.pratyush.orbitmobile.core.firebase.ClipboardCrypto.isValidPlaintextSize(text)) return@launch
+                if (loopGuard.shouldSuppressOutgoing(text)) return@launch
+
                 // Check against last received from Windows
                 if (text == lastReceivedFromWindowsText) {
                     Log.d("HomeVM", "Startup check: matches last received from Windows, skipping")
@@ -313,16 +348,6 @@ class HomeViewModel(
                 // Check against last sent
                 if (text == lastSentClipboardText) {
                     Log.d("HomeVM", "Startup check: already sent, skipping")
-                    return@launch
-                }
-
-                // Check against existing history in local repository
-                val hash = com.pratyush.orbitmobile.domain.model.ClipboardItem.computeHash(text)
-                val currentHistory = _uiState.value.clipboardHistory
-                val alreadyExists = currentHistory.any { it.contentHash == hash || it.content == text }
-                if (alreadyExists) {
-                    Log.d("HomeVM", "Startup check: content already present in clipboard history, suppressing duplicate broadcast")
-                    lastSentClipboardText = text
                     return@launch
                 }
 
@@ -337,6 +362,7 @@ class HomeViewModel(
                     imageFileName = null
                 )
                 if (result is OrbitResult.Success) {
+                    loopGuard.recordOutgoingSent(text)
                     lastSentClipboardText = text
                     _uiState.update { it.copy(lastActionFeedback = "Copied to ORBIT Windows clipboard!") }
                 }
@@ -362,7 +388,8 @@ class HomeViewModel(
         if (_uiState.value.isManualSyncing) return
 
         viewModelScope.launch {
-            if (_uiState.value.connectionState !is ConnectionState.Connected) {
+            val effective = _uiState.value.effectiveConnectionState
+            if (!effective.isConnected) {
                 _uiState.update {
                     it.copy(
                         manualSyncStatus = ManualSyncStatus.Failure("Windows PC is disconnected"),
@@ -387,10 +414,13 @@ class HomeViewModel(
             }
 
             try {
-                // 1. Reconcile available history with Windows PC
-                connectionRepository.refreshClipboardHistoryFromPc()
+                // 1. Reconcile available history with Windows PC when on LAN
+                if (_uiState.value.connectionState is ConnectionState.Connected) {
+                    connectionRepository.refreshClipboardHistoryFromPc()
+                }
 
-                // 2. Read and send current eligible phone clipboard
+                // 2. Read and send current eligible phone clipboard via ClipboardSyncCoordinator
+                var sendFailure: String? = null
                 val cm = clipboardManager
                 val clip = cm?.primaryClip
                 if (clip != null && clip.itemCount > 0) {
@@ -399,34 +429,47 @@ class HomeViewModel(
                     _uiState.update { it.copy(currentClipText = text) }
 
                     if (!text.isNullOrBlank()) {
-                        val isEcho = text == lastReceivedFromWindowsText
-                        val isDuplicate = text == lastSentClipboardText
-                        val hash = com.pratyush.orbitmobile.domain.model.ClipboardItem.computeHash(text)
-                        val topItem = _uiState.value.clipboardHistory.firstOrNull()
-                        val isTopRecent = topItem != null && topItem.contentHash == hash && (System.currentTimeMillis() - topItem.timestamp) < 3000
-
-                        if (!isEcho && !isDuplicate && !isTopRecent) {
-                            val isUrl = text.startsWith("http://") || text.startsWith("https://")
-                            val sendResult = connectionRepository.sendClipboard(
-                                type = if (isUrl) "Url" else "Text",
-                                textContent = text,
-                                urlContent = if (isUrl) text else null,
-                                imageBase64 = null,
-                                imageFileName = null
-                            )
+                        if (!com.pratyush.orbitmobile.core.firebase.ClipboardCrypto.isValidPlaintextSize(text)) {
+                            sendFailure = "Clipboard exceeds 64 KB limit"
+                        } else if (!loopGuard.shouldSuppressOutgoing(text) && text != lastReceivedFromWindowsText) {
+                            val sendResult = if (clipboardSyncCoordinator != null) {
+                                clipboardSyncCoordinator.handleOutgoingClipboardText(text)
+                            } else {
+                                val isUrl = text.startsWith("http://") || text.startsWith("https://")
+                                connectionRepository.sendClipboard(
+                                    type = if (isUrl) "Url" else "Text",
+                                    textContent = text,
+                                    urlContent = if (isUrl) text else null,
+                                    imageBase64 = null,
+                                    imageFileName = null
+                                )
+                            }
                             if (sendResult is OrbitResult.Success) {
+                                loopGuard.recordOutgoingSent(text)
                                 lastSentClipboardText = text
+                            } else if (sendResult is OrbitResult.Error) {
+                                sendFailure = sendResult.exception.message ?: "Sync failed"
                             }
                         }
                     }
                 }
 
-                _uiState.update {
-                    it.copy(
-                        isManualSyncing = false,
-                        manualSyncStatus = ManualSyncStatus.Success,
-                        lastActionFeedback = "Clipboard synchronized successfully!"
-                    )
+                if (sendFailure != null) {
+                    _uiState.update {
+                        it.copy(
+                            isManualSyncing = false,
+                            manualSyncStatus = ManualSyncStatus.Failure(sendFailure),
+                            lastActionFeedback = "Sync failed: $sendFailure"
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isManualSyncing = false,
+                            manualSyncStatus = ManualSyncStatus.Success,
+                            lastActionFeedback = "Clipboard synchronized successfully!"
+                        )
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("HomeVM", "Manual sync error: ${e.message}")
@@ -462,6 +505,9 @@ class HomeViewModel(
                     _uiState.update { it.copy(currentClipText = text) }
 
                     if (!text.isNullOrBlank()) {
+                        if (!_uiState.value.isClipboardSyncActive) return@launch
+                        if (!com.pratyush.orbitmobile.core.firebase.ClipboardCrypto.isValidPlaintextSize(text)) return@launch
+                        if (loopGuard.shouldSuppressOutgoing(text)) return@launch
                         if (text == lastReceivedFromWindowsText) return@launch
                         if (text == lastSentClipboardText) return@launch
 
@@ -472,15 +518,20 @@ class HomeViewModel(
                             return@launch
                         }
 
-                        val isUrl = text.startsWith("http://") || text.startsWith("https://")
-                        val result = connectionRepository.sendClipboard(
-                            type = if (isUrl) "Url" else "Text",
-                            textContent = text,
-                            urlContent = if (isUrl) text else null,
-                            imageBase64 = null,
-                            imageFileName = null
-                        )
+                        val result = if (clipboardSyncCoordinator != null) {
+                            clipboardSyncCoordinator.handleOutgoingClipboardText(text)
+                        } else {
+                            val isUrl = text.startsWith("http://") || text.startsWith("https://")
+                            connectionRepository.sendClipboard(
+                                type = if (isUrl) "Url" else "Text",
+                                textContent = text,
+                                urlContent = if (isUrl) text else null,
+                                imageBase64 = null,
+                                imageFileName = null
+                            )
+                        }
                         if (result is OrbitResult.Success) {
+                            loopGuard.recordOutgoingSent(text)
                             lastSentClipboardText = text
                             _uiState.update { it.copy(lastActionFeedback = "Copied to ORBIT Windows clipboard!") }
                         }
@@ -497,6 +548,7 @@ class HomeViewModel(
      */
     fun copyToLocalClipboard(text: String) {
         try {
+            loopGuard.tryBeginRemoteApply("local-apply-${System.currentTimeMillis()}", text)
             lastReceivedFromWindowsText = text
             val clipData = ClipData.newPlainText("ORBIT", text)
             clipboardManager?.setPrimaryClip(clipData)

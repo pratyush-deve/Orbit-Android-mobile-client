@@ -39,6 +39,7 @@ interface AppContainer {
     val remoteLinkStore: RemoteLinkStore
     val firebasePresenceManager: FirebasePresenceManager
     val firebaseRemoteClient: FirebaseRemoteClient
+    val clipboardSyncCoordinator: com.pratyush.orbitmobile.core.firebase.ClipboardSyncCoordinator
 
     val remoteDataSource: RemoteDataSource
     val deviceRepository: DeviceRepository
@@ -173,6 +174,22 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
 
     override val lanReceiver: com.pratyush.orbitmobile.data.remote.AndroidLanReceiver by lazy {
         com.pratyush.orbitmobile.data.remote.AndroidLanReceiver(connectionRepository)
+    }
+
+    override val clipboardSyncCoordinator: com.pratyush.orbitmobile.core.firebase.ClipboardSyncCoordinator by lazy {
+        com.pratyush.orbitmobile.core.firebase.ClipboardSyncCoordinator(
+            context = appContext,
+            connectionRepository = connectionRepository,
+            preferencesManager = preferencesManager,
+            firebaseRemoteClient = firebaseRemoteClient,
+            firebasePresenceManager = firebasePresenceManager,
+            remoteLinkStore = remoteLinkStore,
+            clientDeviceId = clientDeviceId,
+            pendingClipboardStore = com.pratyush.orbitmobile.core.firebase.PendingClipboardStore(
+                context = appContext,
+                keystoreManager = keystoreManager
+            )
+        )
     }
 
     override val settingsRepository: SettingsRepository by lazy {

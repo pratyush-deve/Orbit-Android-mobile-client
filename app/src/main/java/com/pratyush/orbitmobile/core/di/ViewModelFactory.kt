@@ -28,7 +28,8 @@ class ViewModelFactory(
                     context = appContainer.applicationContext,
                     controlsRepository = appContainer.controlsRepository,
                     firebasePresenceManager = appContainer.firebasePresenceManager,
-                    remoteLinkStore = appContainer.remoteLinkStore
+                    remoteLinkStore = appContainer.remoteLinkStore,
+                    clipboardSyncCoordinator = appContainer.clipboardSyncCoordinator
                 ) as T
             }
             modelClass.isAssignableFrom(ConnectionViewModel::class.java) -> {

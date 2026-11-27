@@ -702,6 +702,9 @@ class ConnectionRepositoryImpl(
         val clientName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
         val content = textContent ?: urlContent ?: ""
         if (content.isBlank()) return OrbitResult.Error(IllegalArgumentException("Empty content"))
+        if (!com.pratyush.orbitmobile.core.firebase.ClipboardCrypto.isValidPlaintextSize(content)) {
+            return OrbitResult.Error(IllegalArgumentException("Clipboard payload exceeds 64 KB UTF-8 limit"))
+        }
 
         val item = ClipboardItem(
             type = type,
@@ -774,7 +777,7 @@ class ConnectionRepositoryImpl(
             saveHistoryToDisk(updated)
             updated
         }
-        Log.i("ConnectionRepo", "Added and persisted clipboard item from $origin: ${item.preview}")
+        Log.i("ConnectionRepo", "Added clipboard item: id=${item.id}, origin=$origin, bytes=${content.toByteArray(Charsets.UTF_8).size}")
     }
 
     override suspend fun refreshClipboardHistoryFromPc(): OrbitResult<Unit> {

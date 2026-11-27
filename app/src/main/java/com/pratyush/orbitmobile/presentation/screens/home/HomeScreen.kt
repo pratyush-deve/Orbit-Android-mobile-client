@@ -217,6 +217,24 @@ fun HomeScreen(
             }
         }
 
+        if (uiState.hasPendingRemoteClipboard) {
+            item(span = { GridItemSpan(2) }) {
+                androidx.compose.material3.Surface(
+                    onClick = { viewModel.applyPendingRemoteClipboard() },
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                    color = Color(0xFF1A1528),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFA855F7))
+                ) {
+                    Text(
+                        text = "Clipboard ready from PC — Tap to copy",
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
+
         // 4. Feature Card 1: Remote Controls (Warm coral / terracotta)
         item {
             RemoteControlsCard(

@@ -9,7 +9,7 @@ data class AppConfig(
     val defaultPort: Int = 8089,
     val hapticFeedbackEnabled: Boolean = true,
     val isPitchBlackTheme: Boolean = true,
-    val isClipboardSyncEnabled: Boolean = true,
+    val isClipboardSyncEnabled: Boolean = false,
     val isExplicitlyDisconnected: Boolean = false,
     val lastConnectedDeviceId: String = "",
     val keepConnectedInBackground: Boolean = true,

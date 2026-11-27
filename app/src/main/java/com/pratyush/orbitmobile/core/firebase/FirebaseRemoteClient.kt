@@ -1,10 +1,12 @@
 package com.pratyush.orbitmobile.core.firebase
 
 import android.util.Log
+import com.google.firebase.database.ChildEventListener
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ServerValue
 import com.google.firebase.database.ValueEventListener
 import com.pratyush.orbitmobile.core.common.OrbitResult
 import com.pratyush.orbitmobile.domain.model.BluetoothControlStatus
@@ -151,6 +153,131 @@ class FirebaseRemoteClient(
             return@withContext OrbitResult.Error(e)
         } finally {
             ackRef.removeEventListener(ackListener)
+        }
+    }
+
+    suspend fun sendClipboardEnvelope(envelope: ClipboardEventEnvelope): OrbitResult<Unit> = withContext(Dispatchers.IO) {
+        val link = linkStore.loadLink()
+            ?: return@withContext OrbitResult.Error(IllegalStateException("No remote link configured."))
+        val uid = identityManager.ensureSignedIn()
+            ?: return@withContext OrbitResult.Error(IllegalStateException("Firebase authentication unavailable."))
+
+        try {
+            val map = mapOf(
+                "eventId" to envelope.eventId,
+                "linkId" to link.linkId,
+                "senderUid" to uid,
+                "targetUid" to (envelope.targetUid.ifBlank { link.peerUid }),
+                "senderDeviceId" to envelope.senderDeviceId,
+                "targetDeviceId" to envelope.targetDeviceId,
+                "issuedAtMs" to envelope.issuedAtMs,
+                "expiresAtMs" to envelope.expiresAtMs,
+                "contentType" to envelope.contentType,
+                "nonce" to envelope.nonce,
+                "encryptedPayload" to envelope.encryptedPayload,
+                "signature" to envelope.signature
+            )
+            database.getReference("links")
+                .child(link.linkId)
+                .child("clipboard")
+                .child("events")
+                .child(envelope.eventId)
+                .setValue(map)
+                .await()
+            Log.i(TAG, "Sent encrypted clipboard event id=${envelope.eventId}, transport=REMOTE")
+            OrbitResult.Success(Unit)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to send remote clipboard event id=${envelope.eventId}: ${e.message}")
+            OrbitResult.Error(e)
+        }
+    }
+
+    fun observeClipboardEvents(
+        onEvent: (ClipboardEventEnvelope) -> Unit,
+        onExpiredOrOwn: ((String) -> Unit)? = null
+    ): (() -> Unit)? {
+        val link = linkStore.loadLink() ?: return null
+        val ref = database.getReference("links").child(link.linkId).child("clipboard").child("events")
+
+        fun parseSnapshot(snapshot: DataSnapshot) {
+            if (!snapshot.exists()) return
+            val eventId = snapshot.child("eventId").getValue(String::class.java) ?: snapshot.key ?: return
+            val senderDeviceId = snapshot.child("senderDeviceId").getValue(String::class.java) ?: ""
+            if (senderDeviceId == clientDeviceId) return
+
+            val expiresAtMs = snapshot.child("expiresAtMs").getValue(Long::class.java) ?: 0L
+            if (expiresAtMs > 0L && System.currentTimeMillis() > expiresAtMs + ClipboardCrypto.MAX_CLOCK_SKEW_MS) {
+                onExpiredOrOwn?.invoke(eventId)
+                return
+            }
+
+            val env = ClipboardEventEnvelope(
+                eventId = eventId,
+                linkId = snapshot.child("linkId").getValue(String::class.java) ?: "",
+                senderDeviceId = senderDeviceId,
+                targetDeviceId = snapshot.child("targetDeviceId").getValue(String::class.java) ?: "",
+                issuedAtMs = snapshot.child("issuedAtMs").getValue(Long::class.java) ?: 0L,
+                expiresAtMs = expiresAtMs,
+                contentType = snapshot.child("contentType").getValue(String::class.java) ?: "",
+                nonce = snapshot.child("nonce").getValue(String::class.java) ?: "",
+                encryptedPayload = snapshot.child("encryptedPayload").getValue(String::class.java) ?: "",
+                signature = snapshot.child("signature").getValue(String::class.java) ?: ""
+            )
+            onEvent(env)
+        }
+
+        val listener = object : ChildEventListener {
+            override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) = parseSnapshot(snapshot)
+            override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) = parseSnapshot(snapshot)
+            override fun onChildRemoved(snapshot: DataSnapshot) {}
+            override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) {}
+            override fun onCancelled(error: DatabaseError) {
+                Log.w(TAG, "Clipboard events listener cancelled: ${error.message}")
+            }
+        }
+        ref.addChildEventListener(listener)
+        return { ref.removeEventListener(listener) }
+    }
+
+    suspend fun acknowledgeClipboardEvent(eventId: String, status: String) = withContext(Dispatchers.IO) {
+        val link = linkStore.loadLink() ?: return@withContext
+        val uid = identityManager.ensureSignedIn() ?: return@withContext
+        runCatching {
+            val ackMap = mapOf(
+                "eventId" to eventId,
+                "ackedByUid" to uid,
+                "status" to status,
+                "ackedAtMs" to ServerValue.TIMESTAMP
+            )
+            database.getReference("links")
+                .child(link.linkId)
+                .child("clipboard")
+                .child("acks")
+                .child(eventId)
+                .setValue(ackMap)
+                .await()
+            if (status == "Applied" || status == "Rejected") {
+                database.getReference("links")
+                    .child(link.linkId)
+                    .child("clipboard")
+                    .child("events")
+                    .child(eventId)
+                    .removeValue()
+                    .await()
+            }
+        }
+    }
+
+    suspend fun deleteClipboardEvent(eventId: String) = withContext(Dispatchers.IO) {
+        val link = linkStore.loadLink() ?: return@withContext
+        runCatching {
+            database.getReference("links")
+                .child(link.linkId)
+                .child("clipboard")
+                .child("events")
+                .child(eventId)
+                .removeValue()
+                .await()
         }
     }
 

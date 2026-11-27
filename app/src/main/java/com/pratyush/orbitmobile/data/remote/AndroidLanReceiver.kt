@@ -1,6 +1,7 @@
 package com.pratyush.orbitmobile.data.remote
 
 import android.util.Log
+import com.pratyush.orbitmobile.core.firebase.ClipboardCrypto
 import com.pratyush.orbitmobile.domain.repository.ConnectionRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +15,7 @@ import java.io.OutputStreamWriter
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 
 /**
  * Embedded LAN receiver for ORBIT Mobile.
@@ -27,6 +29,22 @@ class AndroidLanReceiver(
     companion object {
         private const val TAG = "AndroidLanReceiver"
         const val DEFAULT_PORT = 8768
+
+        internal fun isAuthorizedRequest(activeToken: String?, authHeader: String?): Boolean {
+            if (activeToken.isNullOrBlank() || authHeader.isNullOrBlank()) {
+                return false
+            }
+            val incomingToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
+                authHeader.substring(7).trim()
+            } else {
+                authHeader.trim()
+            }
+            if (incomingToken.isEmpty()) return false
+            return MessageDigest.isEqual(
+                activeToken.toByteArray(Charsets.UTF_8),
+                incomingToken.toByteArray(Charsets.UTF_8)
+            )
+        }
     }
 
     private var serverSocket: ServerSocket? = null
@@ -122,18 +140,12 @@ class AndroidLanReceiver(
                     String(buf, 0, readTotal)
                 } else ""
 
-                // Authenticate request: check bearer token
+                // Authenticate request: require both a valid active session token and matching Authorization header
                 val activeToken = connectionRepository.activeAuthToken
-                if (!activeToken.isNullOrBlank() && !authHeader.isNullOrBlank()) {
-                    val incomingToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
-                        authHeader.substring(7).trim()
-                    } else authHeader.trim()
-
-                    if (incomingToken != activeToken) {
-                        Log.w(TAG, "Unauthorized request: token mismatch")
-                        writeResponse(s, writer, 401, "{\"error\":\"Unauthorized\"}")
-                        return
-                    }
+                if (!isAuthorizedRequest(activeToken, authHeader)) {
+                    Log.w(TAG, "Unauthorized LAN request rejected: method=$method, path=$path")
+                    writeResponse(s, writer, 401, "{\"error\":\"Unauthorized\"}")
+                    return
                 }
 
                 // Route endpoint
@@ -186,7 +198,13 @@ class AndroidLanReceiver(
 
             val content = if (textContent.isNotBlank()) textContent else urlContent
             if (content.isNotBlank()) {
-                Log.i(TAG, "Received clipboard from Windows: '$content' ($type, origin=$deviceOrigin)")
+                val byteCount = content.toByteArray(Charsets.UTF_8).size
+                if (!ClipboardCrypto.isValidPlaintextSize(content)) {
+                    Log.w(TAG, "Rejected oversized LAN clipboard event: eventId=$id, bytes=$byteCount")
+                    writeResponse(socket, writer, 413, "{\"error\":\"Clipboard payload exceeds 64 KB limit\"}")
+                    return
+                }
+                Log.i(TAG, "Received clipboard event from Windows: eventId=$id, bytes=$byteCount, transport=LAN, origin=$deviceOrigin")
                 connectionRepository.receiveIncomingClipboardFromWindows(
                     id = id,
                     type = type,
@@ -210,6 +228,7 @@ class AndroidLanReceiver(
             400 -> "Bad Request"
             401 -> "Unauthorized"
             404 -> "Not Found"
+            413 -> "Payload Too Large"
             else -> "Error"
         }
         val bytes = jsonBody.toByteArray(Charsets.UTF_8)

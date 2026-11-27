@@ -54,6 +54,26 @@ class MainActivity : ComponentActivity() {
         (application as? OrbitMobileApp)?.appContainer?.firebasePresenceManager?.refreshNow()
     }
 
+    override fun onResume() {
+        super.onResume()
+        val coordinator = (application as? OrbitMobileApp)?.appContainer?.clipboardSyncCoordinator
+        coordinator?.setAppForeground(true)
+        if (intent?.action == com.pratyush.orbitmobile.core.firebase.ClipboardSyncCoordinator.ACTION_APPLY_PENDING_CLIPBOARD) {
+            coordinator?.applyPendingClipboard()
+            intent?.action = null
+        }
+    }
+
+    override fun onPause() {
+        (application as? OrbitMobileApp)?.appContainer?.clipboardSyncCoordinator?.setAppForeground(false)
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        (application as? OrbitMobileApp)?.appContainer?.clipboardSyncCoordinator?.onWindowFocusChanged(hasFocus)
+    }
+
     private fun checkAndRequestPermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(

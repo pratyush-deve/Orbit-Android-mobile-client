@@ -63,7 +63,7 @@ class DefaultPreferencesManager(
             defaultPort = preferences[PreferencesKeys.DESKTOP_PORT] ?: Constants.NetworkDefaults.DEFAULT_PORT,
             hapticFeedbackEnabled = preferences[PreferencesKeys.HAPTIC_FEEDBACK] ?: true,
             isPitchBlackTheme = true,
-            isClipboardSyncEnabled = preferences[PreferencesKeys.CLIPBOARD_SYNC] ?: true,
+            isClipboardSyncEnabled = preferences[PreferencesKeys.CLIPBOARD_SYNC] ?: false,
             isExplicitlyDisconnected = preferences[PreferencesKeys.EXPLICITLY_DISCONNECTED] ?: false,
             lastConnectedDeviceId = preferences[PreferencesKeys.LAST_CONNECTED_DEVICE_ID] ?: "",
             keepConnectedInBackground = preferences[PreferencesKeys.KEEP_CONNECTED_IN_BACKGROUND] ?: true,
