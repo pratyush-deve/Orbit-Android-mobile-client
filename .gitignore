@@ -1,0 +1,50 @@
+# Gradle & Build Outputs
+.gradle/
+**/build/
+.kotlin/
+out/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Android Studio / IntelliJ (ignore machine-specific workspace & caches, keep shareable config)
+*.iml
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/deploymentTargetSelector.xml
+.idea/appInsightsSettings.xml
+.DS_Store
+Thumbs.db
+
+# Local SDK & Environment
+local.properties
+
+# Generated & Binary Artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Logs & Temporary Files
+*.log
+*.tmp
+*.bak
+hs_err_pid*.log
+replay_pid*.log
+
+# Secrets, Keystores & Credentials
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+key.properties
+*service-account*.json
+.env
+.env.*
