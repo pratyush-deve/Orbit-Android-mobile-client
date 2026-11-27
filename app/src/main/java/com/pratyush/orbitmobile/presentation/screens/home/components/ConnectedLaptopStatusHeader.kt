@@ -36,6 +36,8 @@ import androidx.compose.ui.unit.sp
 import com.pratyush.orbitmobile.core.designsystem.components.OrganicWaveBackground
 import com.pratyush.orbitmobile.core.designsystem.components.WaveType
 import com.pratyush.orbitmobile.domain.model.ConnectionState
+import com.pratyush.orbitmobile.domain.model.EffectiveConnectionState
+import com.pratyush.orbitmobile.domain.model.resolveEffectiveConnectionState
 
 /**
  * Compact Connected Laptop Card.
@@ -47,31 +49,44 @@ import com.pratyush.orbitmobile.domain.model.ConnectionState
 fun ConnectedLaptopStatusHeader(
     connectionState: ConnectionState,
     deviceName: String? = null,
+    effectiveState: EffectiveConnectionState? = null,
     modifier: Modifier = Modifier
 ) {
-    val laptopName = when (connectionState) {
-        is ConnectionState.Connected -> connectionState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
-        is ConnectionState.Connecting -> connectionState.deviceName.ifBlank { deviceName ?: "Connecting..." }
-        is ConnectionState.TemporarilyUnavailable -> connectionState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
-        else -> deviceName?.ifBlank { "ORBIT Windows PC" } ?: "ORBIT Windows PC"
+    val resolvedState = effectiveState ?: resolveEffectiveConnectionState(
+        lanState = connectionState,
+        peerPresence = null,
+        hasRemoteLink = false,
+        fallbackDeviceName = deviceName?.ifBlank { "ORBIT Windows PC" } ?: "ORBIT Windows PC"
+    )
+
+    val laptopName = when (resolvedState) {
+        is EffectiveConnectionState.ConnectedLan -> resolvedState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
+        is EffectiveConnectionState.ConnectedRemote -> resolvedState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
+        is EffectiveConnectionState.Reconnecting -> resolvedState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
+        is EffectiveConnectionState.TemporarilyUnavailable -> resolvedState.deviceName.ifBlank { deviceName ?: "ORBIT Windows PC" }
+        EffectiveConnectionState.Disconnected -> deviceName?.ifBlank { "ORBIT Windows PC" } ?: "ORBIT Windows PC"
     }
 
-    val isOnline = connectionState is ConnectionState.Connected
-    val isPaused = connectionState is ConnectionState.TemporarilyUnavailable
-    val latencyMs = when (connectionState) {
-        is ConnectionState.Connected -> connectionState.latencyMs
+    val isOnline = resolvedState.isConnected
+    val isPaused = resolvedState is EffectiveConnectionState.Reconnecting ||
+        resolvedState is EffectiveConnectionState.TemporarilyUnavailable
+    val latencyMs = when (resolvedState) {
+        is EffectiveConnectionState.ConnectedLan -> resolvedState.latencyMs
         else -> 0L
     }
 
-    val connType = when (connectionState) {
-        is ConnectionState.Connected -> connectionState.connectionType.ifBlank { "LAN" }
-        else -> "LAN"
+    val connType = when (resolvedState) {
+        is EffectiveConnectionState.ConnectedLan -> "LAN"
+        is EffectiveConnectionState.ConnectedRemote -> "REMOTE"
+        is EffectiveConnectionState.Reconnecting -> "RECONNECTING"
+        is EffectiveConnectionState.TemporarilyUnavailable -> "UNAVAILABLE"
+        EffectiveConnectionState.Disconnected -> "UNAVAILABLE"
     }
 
     // Dynamic status color: Green for online, Amber for paused/reconnecting, Red for offline
     val statusColor by animateColorAsState(
         targetValue = when {
-            isOnline -> Color(0xFF22C55E)
+            isOnline -> Color(0xFF10B981)
             isPaused -> Color(0xFFF59E0B)
             else -> Color(0xFFEF4444)
         },
@@ -182,7 +197,12 @@ fun ConnectedLaptopStatusHeader(
                         modifier = Modifier.size(11.dp)
                     )
                     Text(
-                        text = if (latencyMs > 0) "$latencyMs ms" else if (isOnline) "< 1 ms" else "— ms",
+                        text = when {
+                            resolvedState is EffectiveConnectionState.ConnectedRemote -> "Firebase"
+                            latencyMs > 0 -> "$latencyMs ms"
+                            isOnline -> "< 1 ms"
+                            else -> "— ms"
+                        },
                         style = MaterialTheme.typography.labelSmall.copy(
                             color = Color(0xFF94A3B8),
                             fontSize = 11.sp,

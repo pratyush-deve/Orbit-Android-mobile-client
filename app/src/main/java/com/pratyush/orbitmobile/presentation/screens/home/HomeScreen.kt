@@ -202,12 +202,13 @@ fun HomeScreen(
         item(span = { GridItemSpan(2) }) {
             ConnectedLaptopStatusHeader(
                 connectionState = uiState.connectionState,
-                deviceName = uiState.lastKnownDeviceName
+                deviceName = uiState.lastKnownDeviceName,
+                effectiveState = uiState.effectiveConnectionState
             )
         }
 
-        // 3. Reconnection Banner (displayed when disconnected, unavailable, error, or reconnecting)
-        if (uiState.connectionState !is ConnectionState.Connected || uiState.isReconnecting) {
+        // 3. Reconnection Banner (displayed only when neither LAN nor Remote transport is active, or while reconnecting)
+        if (!uiState.effectiveConnectionState.isConnected || uiState.isReconnecting) {
             item(span = { GridItemSpan(2) }) {
                 DisconnectedWarningBanner(
                     isReconnecting = uiState.isReconnecting,

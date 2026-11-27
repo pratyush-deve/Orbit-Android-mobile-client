@@ -2,6 +2,7 @@ package com.pratyush.orbitmobile.presentation.screens.home
 
 import com.pratyush.orbitmobile.domain.model.ClipboardItem
 import com.pratyush.orbitmobile.domain.model.ConnectionState
+import com.pratyush.orbitmobile.domain.model.EffectiveConnectionState
 
 /**
  * Result state for manual clipboard sync operations.
@@ -18,6 +19,7 @@ sealed interface ManualSyncStatus {
  */
 data class HomeUiState(
     val connectionState: ConnectionState = ConnectionState.Disconnected,
+    val effectiveConnectionState: EffectiveConnectionState = EffectiveConnectionState.Disconnected,
     val lastKnownDeviceName: String = "ORBIT Windows PC",
     val isReconnecting: Boolean = false,
     val isClipboardSyncActive: Boolean = true,

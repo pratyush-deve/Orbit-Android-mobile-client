@@ -17,11 +17,19 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 
+data class RemoteLinkPayload(
+    val linkId: String,
+    val windowsUid: String,
+    val windowsDeviceId: String,
+    val sharedSecret: String
+)
+
 data class PairingResultData(
     val status: String,
     val serverDeviceId: String,
     val serverDeviceName: String,
-    val authToken: String
+    val authToken: String,
+    val remoteLink: RemoteLinkPayload? = null
 )
 
 /**
@@ -38,7 +46,8 @@ interface RemoteDataSource {
         clientDeviceName: String,
         clientDeviceModel: String,
         osVersion: String,
-        appVersion: String
+        appVersion: String,
+        firebaseUid: String? = null
     ): OrbitResult<PairingResultData>
     suspend fun sendTelemetry(
         host: String,
@@ -90,7 +99,8 @@ interface RemoteDataSource {
         port: Int,
         authToken: String,
         clientDeviceId: String,
-        clientDeviceName: String
+        clientDeviceName: String,
+        firebaseUid: String? = null
     ): OrbitResult<PairingResultData>
 
     // Laptop Remote Controls
@@ -267,7 +277,8 @@ class DefaultRemoteDataSource : RemoteDataSource {
         clientDeviceName: String,
         clientDeviceModel: String,
         osVersion: String,
-        appVersion: String
+        appVersion: String,
+        firebaseUid: String?
     ): OrbitResult<PairingResultData> = withContext(Dispatchers.IO) {
         try {
             Log.i(TAG, "Requesting pairing: endpoint=$endpointUrl device=$clientDeviceName ($clientDeviceId)")
@@ -288,6 +299,9 @@ class DefaultRemoteDataSource : RemoteDataSource {
                 put("osVersion", osVersion)
                 put("appVersion", appVersion)
                 put("receiverPort", 8768)
+                if (!firebaseUid.isNullOrBlank()) {
+                    put("firebaseUid", firebaseUid)
+                }
             }
 
             val writer = OutputStreamWriter(conn.outputStream, "UTF-8")
@@ -310,6 +324,7 @@ class DefaultRemoteDataSource : RemoteDataSource {
                 val serverDeviceId = json.optString("serverDeviceId", "")
                 val serverDeviceName = json.optString("serverDeviceName", "ORBIT Windows PC")
                 val authToken = json.optString("authToken", "")
+                val remoteLink = parseRemoteLinkPayload(json.optJSONObject("remoteLink"))
 
                 Log.i(TAG, "Pairing approved by Windows companion ($serverDeviceName)")
                 OrbitResult.Success(
@@ -317,7 +332,8 @@ class DefaultRemoteDataSource : RemoteDataSource {
                         status = status,
                         serverDeviceId = serverDeviceId,
                         serverDeviceName = serverDeviceName,
-                        authToken = authToken
+                        authToken = authToken,
+                        remoteLink = remoteLink
                     )
                 )
             } else {
@@ -1199,7 +1215,8 @@ class DefaultRemoteDataSource : RemoteDataSource {
         port: Int,
         authToken: String,
         clientDeviceId: String,
-        clientDeviceName: String
+        clientDeviceName: String,
+        firebaseUid: String?
     ): OrbitResult<PairingResultData> = withContext(Dispatchers.IO) {
         try {
             val url = URL("http://$host:$port/api/mobile/reconnect")
@@ -1217,6 +1234,9 @@ class DefaultRemoteDataSource : RemoteDataSource {
                 put("clientDeviceName", clientDeviceName)
                 put("authToken", authToken)
                 put("receiverPort", 8768)
+                if (!firebaseUid.isNullOrBlank()) {
+                    put("firebaseUid", firebaseUid)
+                }
             }
 
             val writer = OutputStreamWriter(conn.outputStream, "UTF-8")
@@ -1238,7 +1258,8 @@ class DefaultRemoteDataSource : RemoteDataSource {
                         status = json.optString("status", "reconnected"),
                         serverDeviceId = json.optString("serverDeviceId", ""),
                         serverDeviceName = json.optString("serverDeviceName", "ORBIT Windows PC"),
-                        authToken = json.optString("authToken", authToken)
+                        authToken = json.optString("authToken", authToken),
+                        remoteLink = parseRemoteLinkPayload(json.optJSONObject("remoteLink"))
                     )
                 )
             } else {
@@ -2417,5 +2438,20 @@ class DefaultRemoteDataSource : RemoteDataSource {
         } finally {
             conn?.disconnect()
         }
+    }
+
+    private fun parseRemoteLinkPayload(obj: JSONObject?): RemoteLinkPayload? {
+        if (obj == null) return null
+        val linkId = obj.optString("linkId", "")
+        val windowsUid = obj.optString("windowsUid", "")
+        val windowsDeviceId = obj.optString("windowsDeviceId", "")
+        val sharedSecret = obj.optString("sharedSecret", "")
+        if (linkId.isBlank() || sharedSecret.isBlank()) return null
+        return RemoteLinkPayload(
+            linkId = linkId,
+            windowsUid = windowsUid,
+            windowsDeviceId = windowsDeviceId,
+            sharedSecret = sharedSecret
+        )
     }
 }

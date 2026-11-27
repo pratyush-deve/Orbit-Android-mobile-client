@@ -6,6 +6,11 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.util.Log
 import com.pratyush.orbitmobile.core.common.OrbitResult
+import com.pratyush.orbitmobile.core.firebase.FirebaseIdentityManager
+import com.pratyush.orbitmobile.core.firebase.FirebasePresenceManager
+import com.pratyush.orbitmobile.core.firebase.RemoteLinkCredentials
+import com.pratyush.orbitmobile.core.firebase.RemoteLinkStore
+import com.pratyush.orbitmobile.data.remote.PairingResultData
 import com.pratyush.orbitmobile.data.remote.RemoteDataSource
 import com.pratyush.orbitmobile.domain.model.ClipboardItem
 import com.pratyush.orbitmobile.domain.model.ConnectionState
@@ -36,7 +41,10 @@ import java.util.UUID
 class ConnectionRepositoryImpl(
     private val remoteDataSource: RemoteDataSource,
     private val deviceRepository: DeviceRepository,
-    private val context: Context? = null
+    private val context: Context? = null,
+    private val firebaseIdentityManager: FirebaseIdentityManager? = null,
+    private val remoteLinkStore: RemoteLinkStore? = null,
+    private val firebasePresenceManager: FirebasePresenceManager? = null
 ) : ConnectionRepository {
 
     companion object {
@@ -424,6 +432,7 @@ class ConnectionRepositoryImpl(
             val osVersion = "Android ${Build.VERSION.RELEASE}"
             val appVersion = "ORBIT Mobile v1.0"
 
+            val fbUid = firebaseIdentityManager?.ensureSignedIn()
             val pairResult = remoteDataSource.requestPairing(
                 endpointUrl = endpoint,
                 sessionId = sessionId,
@@ -432,7 +441,8 @@ class ConnectionRepositoryImpl(
                 clientDeviceName = clientName,
                 clientDeviceModel = clientModel,
                 osVersion = osVersion,
-                appVersion = appVersion
+                appVersion = appVersion,
+                firebaseUid = fbUid
             )
 
             when (pairResult) {
@@ -440,6 +450,7 @@ class ConnectionRepositoryImpl(
                     val data = pairResult.data
                     _authToken = data.authToken
                     saveSessionIdentity(host, port, data.authToken)
+                    handleRemoteLinkIfPresent(data)
 
                     val pingLatency = (remoteDataSource.ping(host, port) as? OrbitResult.Success)?.data ?: 8L
 
@@ -503,9 +514,11 @@ class ConnectionRepositoryImpl(
 
                     val clientName = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
                     val tok = _authToken ?: "anonymous"
-                    val reconnectRes = remoteDataSource.reconnect(device.ipAddress, device.port, tok, clientDeviceId, clientName)
+                    val fbUid = firebaseIdentityManager?.ensureSignedIn()
+                    val reconnectRes = remoteDataSource.reconnect(device.ipAddress, device.port, tok, clientDeviceId, clientName, fbUid)
                     if (reconnectRes is OrbitResult.Success) {
                         _authToken = reconnectRes.data.authToken
+                        handleRemoteLinkIfPresent(reconnectRes.data)
                     }
                     saveSessionIdentity(device.ipAddress, device.port, _authToken)
 
@@ -877,8 +890,9 @@ class ConnectionRepositoryImpl(
                 val tok = _authToken ?: "anonymous"
                 val host = _host ?: targetDevice.ipAddress
                 val port = _port
+                val fbUid = firebaseIdentityManager?.ensureSignedIn()
 
-                var reconnectResult = remoteDataSource.reconnect(host, port, tok, clientDeviceId, clientName)
+                var reconnectResult = remoteDataSource.reconnect(host, port, tok, clientDeviceId, clientName, fbUid)
                 if (reconnectResult is OrbitResult.Success && epoch == connectionEpoch.get()) {
                     val pingCheck = remoteDataSource.ping(host, port)
                     if (pingCheck is OrbitResult.Success) {
@@ -886,6 +900,7 @@ class ConnectionRepositoryImpl(
                         _host = host
                         _port = port
                         saveSessionIdentity(host, port, _authToken)
+                        handleRemoteLinkIfPresent(reconnectResult.data)
                         _isExplicitlyDisconnected = false
                         lastSuccessfulHeartbeatTime = System.currentTimeMillis()
                         consecutiveHeartbeatFailures = 0
@@ -913,7 +928,7 @@ class ConnectionRepositoryImpl(
                 val probedEndpoint = discoverViaUdp()
                 if (probedEndpoint != null && epoch == connectionEpoch.get()) {
                     val (probedHost, probedPort) = probedEndpoint
-                    reconnectResult = remoteDataSource.reconnect(probedHost, probedPort, tok, clientDeviceId, clientName)
+                    reconnectResult = remoteDataSource.reconnect(probedHost, probedPort, tok, clientDeviceId, clientName, fbUid)
                     if (reconnectResult is OrbitResult.Success && epoch == connectionEpoch.get()) {
                         val pingCheck = remoteDataSource.ping(probedHost, probedPort)
                         if (pingCheck is OrbitResult.Success) {
@@ -921,6 +936,7 @@ class ConnectionRepositoryImpl(
                             _host = probedHost
                             _port = probedPort
                             saveSessionIdentity(probedHost, probedPort, _authToken)
+                            handleRemoteLinkIfPresent(reconnectResult.data)
                             _isExplicitlyDisconnected = false
                             lastSuccessfulHeartbeatTime = System.currentTimeMillis()
                             consecutiveHeartbeatFailures = 0
@@ -962,6 +978,19 @@ class ConnectionRepositoryImpl(
         } finally {
             reconnectMutex.unlock()
         }
+    }
+
+    private fun handleRemoteLinkIfPresent(data: PairingResultData) {
+        val link = data.remoteLink ?: return
+        remoteLinkStore?.saveLink(
+            RemoteLinkCredentials(
+                linkId = link.linkId,
+                peerDeviceId = link.windowsDeviceId.ifBlank { data.serverDeviceId },
+                peerUid = link.windowsUid,
+                sharedSecret = link.sharedSecret
+            )
+        )
+        firebasePresenceManager?.start()
     }
 
     private fun discoverViaUdp(): Pair<String, Int>? {

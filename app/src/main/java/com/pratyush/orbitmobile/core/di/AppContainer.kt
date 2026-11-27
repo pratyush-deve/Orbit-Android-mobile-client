@@ -1,6 +1,10 @@
 package com.pratyush.orbitmobile.core.di
 
 import android.content.Context
+import com.pratyush.orbitmobile.core.firebase.FirebaseIdentityManager
+import com.pratyush.orbitmobile.core.firebase.FirebasePresenceManager
+import com.pratyush.orbitmobile.core.firebase.FirebaseRemoteClient
+import com.pratyush.orbitmobile.core.firebase.RemoteLinkStore
 import com.pratyush.orbitmobile.core.platform.DefaultKeystoreManager
 import com.pratyush.orbitmobile.core.platform.DefaultNetworkMonitor
 import com.pratyush.orbitmobile.core.platform.KeystoreManager
@@ -31,6 +35,10 @@ interface AppContainer {
     val preferencesManager: PreferencesManager
     val keystoreManager: KeystoreManager
     val networkMonitor: NetworkMonitor
+    val firebaseIdentityManager: FirebaseIdentityManager
+    val remoteLinkStore: RemoteLinkStore
+    val firebasePresenceManager: FirebasePresenceManager
+    val firebaseRemoteClient: FirebaseRemoteClient
 
     val remoteDataSource: RemoteDataSource
     val deviceRepository: DeviceRepository
@@ -71,6 +79,34 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
         DefaultNetworkMonitor(appContext)
     }
 
+    override val firebaseIdentityManager: FirebaseIdentityManager by lazy {
+        FirebaseIdentityManager()
+    }
+
+    override val remoteLinkStore: RemoteLinkStore by lazy {
+        RemoteLinkStore(appContext, keystoreManager)
+    }
+
+    private val clientDeviceId: String by lazy {
+        val prefs = appContext.getSharedPreferences("orbit_identity", Context.MODE_PRIVATE)
+        val savedId = prefs.getString("client_device_id", null)
+        if (!savedId.isNullOrBlank()) {
+            savedId
+        } else {
+            val newId = java.util.UUID.randomUUID().toString()
+            prefs.edit().putString("client_device_id", newId).apply()
+            newId
+        }
+    }
+
+    override val firebasePresenceManager: FirebasePresenceManager by lazy {
+        FirebasePresenceManager(firebaseIdentityManager, remoteLinkStore, clientDeviceId)
+    }
+
+    override val firebaseRemoteClient: FirebaseRemoteClient by lazy {
+        FirebaseRemoteClient(firebaseIdentityManager, remoteLinkStore, firebasePresenceManager, clientDeviceId)
+    }
+
     override val remoteDataSource: RemoteDataSource by lazy {
         DefaultRemoteDataSource()
     }
@@ -80,13 +116,22 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
     }
 
     override val connectionRepository: ConnectionRepository by lazy {
-        ConnectionRepositoryImpl(remoteDataSource, deviceRepository, appContext)
+        ConnectionRepositoryImpl(
+            remoteDataSource = remoteDataSource,
+            deviceRepository = deviceRepository,
+            context = appContext,
+            firebaseIdentityManager = firebaseIdentityManager,
+            remoteLinkStore = remoteLinkStore,
+            firebasePresenceManager = firebasePresenceManager
+        )
     }
 
     override val controlsRepository: com.pratyush.orbitmobile.domain.repository.ControlsRepository by lazy {
         com.pratyush.orbitmobile.data.repository.implementations.ControlsRepositoryImpl(
             connectionRepository = connectionRepository,
-            remoteDataSource = remoteDataSource
+            remoteDataSource = remoteDataSource,
+            firebaseRemoteClient = firebaseRemoteClient,
+            firebasePresenceManager = firebasePresenceManager
         )
     }
 
@@ -100,7 +145,9 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
     override val systemMonitorRepository: com.pratyush.orbitmobile.domain.repository.SystemMonitorRepository by lazy {
         com.pratyush.orbitmobile.data.repository.implementations.SystemMonitorRepositoryImpl(
             connectionRepository = connectionRepository,
-            remoteDataSource = remoteDataSource
+            remoteDataSource = remoteDataSource,
+            firebaseRemoteClient = firebaseRemoteClient,
+            firebasePresenceManager = firebasePresenceManager
         )
     }
 

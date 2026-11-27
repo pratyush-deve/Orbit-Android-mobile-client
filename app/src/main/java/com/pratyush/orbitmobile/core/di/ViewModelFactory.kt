@@ -26,7 +26,9 @@ class ViewModelFactory(
                     connectionRepository = appContainer.connectionRepository,
                     preferencesManager = appContainer.preferencesManager,
                     context = appContainer.applicationContext,
-                    controlsRepository = appContainer.controlsRepository
+                    controlsRepository = appContainer.controlsRepository,
+                    firebasePresenceManager = appContainer.firebasePresenceManager,
+                    remoteLinkStore = appContainer.remoteLinkStore
                 ) as T
             }
             modelClass.isAssignableFrom(ConnectionViewModel::class.java) -> {

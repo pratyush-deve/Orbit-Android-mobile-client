@@ -7,10 +7,14 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.pratyush.orbitmobile.core.common.OrbitResult
+import com.pratyush.orbitmobile.core.firebase.FirebasePresenceManager
+import com.pratyush.orbitmobile.core.firebase.RemoteLinkStore
 import com.pratyush.orbitmobile.core.platform.TelemetryCollector
 import com.pratyush.orbitmobile.data.local.preferences.PreferencesManager
 import com.pratyush.orbitmobile.domain.model.ClipboardItem
 import com.pratyush.orbitmobile.domain.model.ConnectionState
+import com.pratyush.orbitmobile.domain.model.EffectiveConnectionState
+import com.pratyush.orbitmobile.domain.model.resolveEffectiveConnectionState
 import com.pratyush.orbitmobile.domain.repository.ConnectionRepository
 import com.pratyush.orbitmobile.domain.repository.ControlsRepository
 import com.pratyush.orbitmobile.domain.usecase.ConnectDeviceUseCase
@@ -23,8 +27,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -42,7 +49,9 @@ class HomeViewModel(
     private val connectionRepository: ConnectionRepository,
     private val preferencesManager: PreferencesManager,
     private val context: Context,
-    private val controlsRepository: ControlsRepository? = null
+    private val controlsRepository: ControlsRepository? = null,
+    private val firebasePresenceManager: FirebasePresenceManager? = null,
+    private val remoteLinkStore: RemoteLinkStore? = null
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -82,18 +91,38 @@ class HomeViewModel(
     }
 
     private fun observeConnectionStatus() {
-        getConnectionStatusUseCase.execute()
-            .onEach { status ->
+        val peerPresenceFlow = firebasePresenceManager?.peerPresence ?: MutableStateFlow(null)
+        val reconnectingFlow = _uiState.map { it.isReconnecting }.distinctUntilChanged()
+
+        combine(
+            getConnectionStatusUseCase.execute(),
+            peerPresenceFlow,
+            reconnectingFlow
+        ) { status, peerPresence, isReconnecting ->
+            Triple(status, peerPresence, isReconnecting)
+        }
+            .onEach { (status, peerPresence, isReconnecting) ->
+                val hasRemoteLink = remoteLinkStore?.loadLink() != null
                 _uiState.update { current ->
-                    val newDeviceName = when (status) {
-                        is ConnectionState.Connected -> status.deviceName
-                        is ConnectionState.Connecting -> status.deviceName
-                        is ConnectionState.TemporarilyUnavailable -> status.deviceName
+                    val newDeviceName = when {
+                        status is ConnectionState.Connected -> status.deviceName
+                        status is ConnectionState.Connecting -> status.deviceName
+                        status is ConnectionState.TemporarilyUnavailable -> status.deviceName
+                        peerPresence?.online == true && !peerPresence.isStale -> peerPresence.deviceName
                         else -> current.lastKnownDeviceName
                     }
+                    val resolvedDeviceName = if (newDeviceName.isNotBlank()) newDeviceName else current.lastKnownDeviceName
+                    val effective = resolveEffectiveConnectionState(
+                        lanState = status,
+                        peerPresence = peerPresence,
+                        hasRemoteLink = hasRemoteLink,
+                        isReconnecting = isReconnecting,
+                        fallbackDeviceName = resolvedDeviceName
+                    )
                     current.copy(
                         connectionState = status,
-                        lastKnownDeviceName = if (newDeviceName.isNotBlank()) newDeviceName else current.lastKnownDeviceName
+                        effectiveConnectionState = effective,
+                        lastKnownDeviceName = resolvedDeviceName
                     )
                 }
                 if (status is ConnectionState.Connected) {
