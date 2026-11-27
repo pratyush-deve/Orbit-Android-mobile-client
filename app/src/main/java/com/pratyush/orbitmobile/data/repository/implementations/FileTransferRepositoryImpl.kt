@@ -1,17 +1,22 @@
 package com.pratyush.orbitmobile.data.repository.implementations
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 import com.pratyush.orbitmobile.core.common.OrbitResult
+import com.pratyush.orbitmobile.core.firebase.FileTransferCrypto
+import com.pratyush.orbitmobile.core.firebase.FirebaseFileTransferClient
 import com.pratyush.orbitmobile.data.remote.RemoteDataSource
+import com.pratyush.orbitmobile.domain.model.ConnectionState
 import com.pratyush.orbitmobile.domain.model.FileCategory
 import com.pratyush.orbitmobile.domain.model.FileTransferState
 import com.pratyush.orbitmobile.domain.model.ReceivedRemoteFile
 import com.pratyush.orbitmobile.domain.model.SelectedFileItem
 import com.pratyush.orbitmobile.domain.repository.ConnectionRepository
 import com.pratyush.orbitmobile.domain.repository.FileTransferRepository
+import com.pratyush.orbitmobile.services.RemoteFileTransferService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,7 +33,8 @@ class FileTransferRepositoryImpl(
     private val context: Context,
     private val connectionRepository: ConnectionRepository,
     private val remoteDataSource: RemoteDataSource,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO),
+    private val firebaseFileTransferClient: FirebaseFileTransferClient? = null
 ) : FileTransferRepository {
 
     private val _selectedFiles = MutableStateFlow<List<SelectedFileItem>>(emptyList())
@@ -58,6 +64,12 @@ class FileTransferRepositoryImpl(
 
             val item = resolveUri(uri)
             if (item != null) {
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
                 currentList.add(item)
                 addedCount++
             }
@@ -91,6 +103,19 @@ class FileTransferRepositoryImpl(
         val filesToSend = _selectedFiles.value
         if (filesToSend.isEmpty()) {
             return@withContext OrbitResult.Error(IllegalStateException("No files selected"))
+        }
+
+        val lanConnected = connectionRepository.connectionState.value is ConnectionState.Connected &&
+            connectionRepository.activeHost != null
+
+        if (!lanConnected) {
+            val remoteClient = firebaseFileTransferClient
+            if (remoteClient != null && remoteClient.isRemoteAvailable) {
+                return@withContext startRemoteTransfer(filesToSend, remoteClient)
+            }
+            val msg = "Laptop is unavailable (neither LAN nor remote connection is active)"
+            _transferState.value = FileTransferState.Failed(msg, filesToSend)
+            return@withContext OrbitResult.Error(IllegalStateException(msg))
         }
 
         val host = connectionRepository.activeHost
@@ -273,6 +298,122 @@ class FileTransferRepositoryImpl(
         } catch (e: Exception) {
             _transferState.value = FileTransferState.Failed(e.message ?: "Transfer failed", failedFiles)
             OrbitResult.Error(e)
+        }
+    }
+
+    private suspend fun startRemoteTransfer(
+        filesToSend: List<SelectedFileItem>,
+        remoteClient: FirebaseFileTransferClient
+    ): OrbitResult<Unit> {
+        isCancelled = false
+        val totalFiles = filesToSend.size
+        val totalBytesAll = filesToSend.sumOf { it.size }
+        var bytesTransferredBase = 0L
+        val failedFiles = mutableListOf<SelectedFileItem>()
+
+        val transferStartTime = System.currentTimeMillis()
+        var lastSpeedCalcTime = transferStartTime
+        var lastSpeedCalcBytes = 0L
+        var currentSpeed = 0L
+
+        RemoteFileTransferService.start(
+            context = context,
+            title = "Sending $totalFiles file(s) remotely",
+            detail = "Preparing encrypted upload..."
+        )
+
+        try {
+            for ((index, file) in filesToSend.withIndex()) {
+                if (isCancelled) {
+                    _transferState.value = FileTransferState.Cancelled
+                    return OrbitResult.Success(Unit)
+                }
+
+                if (file.size > FileTransferCrypto.MAX_REMOTE_FILE_SIZE_BYTES) {
+                    Log.w(TAG, "File '${file.name}' (${file.size} bytes) exceeds remote limit.")
+                    failedFiles.add(file)
+                    continue
+                }
+
+                _transferState.value = FileTransferState.Preparing(file.name)
+                RemoteFileTransferService.updateProgress(
+                    context = context,
+                    title = "Sending ${index + 1}/$totalFiles: ${file.name}",
+                    detail = "Encrypting & uploading via Firebase...",
+                    progressPercent = if (totalBytesAll > 0) ((bytesTransferredBase * 100) / totalBytesAll).toInt().coerceIn(0, 100) else 0
+                )
+
+                val transferId = UUID.randomUUID().toString()
+                val res = remoteClient.sendFileRemote(
+                    transferId = transferId,
+                    uri = file.uri,
+                    fileName = file.name,
+                    fileSize = file.size,
+                    mimeType = file.mimeType,
+                    isCancelled = { isCancelled },
+                    onProgress = { fileBytes, _ ->
+                        val totalNow = bytesTransferredBase + fileBytes
+                        val now = System.currentTimeMillis()
+                        val timeDiff = now - lastSpeedCalcTime
+                        if (timeDiff >= 500) {
+                            val bytesDiff = totalNow - lastSpeedCalcBytes
+                            currentSpeed = (bytesDiff * 1000L) / timeDiff.coerceAtLeast(1L)
+                            lastSpeedCalcTime = now
+                            lastSpeedCalcBytes = totalNow
+                        }
+                        val currentProgress = if (file.size > 0) fileBytes.toFloat() / file.size else 1f
+                        val overallProgress = if (totalBytesAll > 0) totalNow.toFloat() / totalBytesAll else 1f
+                        _transferState.value = FileTransferState.Transferring(
+                            currentFileIndex = index + 1,
+                            totalFiles = totalFiles,
+                            currentFileName = file.name,
+                            currentFileProgress = currentProgress.coerceIn(0f, 1f),
+                            overallProgress = overallProgress.coerceIn(0f, 1f),
+                            bytesTransferred = totalNow,
+                            totalBytes = totalBytesAll,
+                            speedBytesPerSec = currentSpeed
+                        )
+                        RemoteFileTransferService.updateProgress(
+                            context = context,
+                            title = "Sending ${index + 1}/$totalFiles: ${file.name}",
+                            detail = "${(overallProgress * 100).toInt()}% • ${SelectedFileItem.formatBytes(totalNow)} / ${SelectedFileItem.formatBytes(totalBytesAll)}",
+                            progressPercent = (overallProgress * 100).toInt().coerceIn(0, 100)
+                        )
+                    }
+                )
+
+                if (res is OrbitResult.Success) {
+                    bytesTransferredBase += file.size
+                } else {
+                    if (isCancelled) {
+                        _transferState.value = FileTransferState.Cancelled
+                        return OrbitResult.Success(Unit)
+                    }
+                    failedFiles.add(file)
+                }
+            }
+
+            return if (failedFiles.isEmpty()) {
+                _selectedFiles.value = emptyList()
+                _transferState.value = FileTransferState.Completed(totalFiles, totalBytesAll)
+                OrbitResult.Success(Unit)
+            } else {
+                _selectedFiles.value = failedFiles
+                _transferState.value = FileTransferState.Completed(
+                    totalFiles = totalFiles - failedFiles.size,
+                    totalBytes = totalBytesAll,
+                    failedFiles = failedFiles
+                )
+                OrbitResult.Error(IllegalStateException("${failedFiles.size} remote transfer(s) failed or exceeded 50 MB limit."))
+            }
+        } catch (e: CancellationException) {
+            _transferState.value = FileTransferState.Cancelled
+            return OrbitResult.Success(Unit)
+        } catch (e: Exception) {
+            _transferState.value = FileTransferState.Failed(e.message ?: "Remote transfer failed", failedFiles)
+            return OrbitResult.Error(e)
+        } finally {
+            RemoteFileTransferService.stop(context)
         }
     }
 

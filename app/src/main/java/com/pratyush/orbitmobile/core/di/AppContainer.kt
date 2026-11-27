@@ -164,11 +164,22 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
         )
     }
 
+    val firebaseFileTransferClient: com.pratyush.orbitmobile.core.firebase.FirebaseFileTransferClient by lazy {
+        com.pratyush.orbitmobile.core.firebase.FirebaseFileTransferClient(
+            context = appContext,
+            identityManager = firebaseIdentityManager,
+            linkStore = remoteLinkStore,
+            presenceManager = firebasePresenceManager,
+            clientDeviceId = clientDeviceId
+        )
+    }
+
     override val fileTransferRepository: com.pratyush.orbitmobile.domain.repository.FileTransferRepository by lazy {
         com.pratyush.orbitmobile.data.repository.implementations.FileTransferRepositoryImpl(
             context = appContext,
             connectionRepository = connectionRepository,
-            remoteDataSource = remoteDataSource
+            remoteDataSource = remoteDataSource,
+            firebaseFileTransferClient = firebaseFileTransferClient
         )
     }
 

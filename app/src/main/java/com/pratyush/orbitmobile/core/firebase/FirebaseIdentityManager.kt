@@ -74,6 +74,20 @@ class FirebaseIdentityManager(
         return@withLock signInAnonymouslyInternal()
     }
 
+    suspend fun getValidIdToken(): String? = authMutex.withLock {
+        val user = auth.currentUser ?: run {
+            signInAnonymouslyInternal()
+            auth.currentUser
+        } ?: return@withLock null
+
+        return@withLock try {
+            user.getIdToken(false).await()?.token
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to retrieve Firebase ID token: ${e.message}")
+            null
+        }
+    }
+
     private suspend fun signInAnonymouslyInternal(): String? {
         _authState.value = FirebaseAuthState.Authenticating
         return try {

@@ -11,6 +11,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
@@ -44,6 +45,11 @@
         <service
             android:name=".services.OrbitBackgroundService"
             android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <service
+            android:name=".services.RemoteFileTransferService"
+            android:foregroundServiceType="dataSync"
             android:exported="false" />
     </application>
 
