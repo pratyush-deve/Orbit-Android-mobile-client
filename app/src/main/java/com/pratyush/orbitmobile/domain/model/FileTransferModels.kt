@@ -80,9 +80,19 @@ data class SelectedFileItem(
     }
 }
 
+enum class TransferPhase {
+    PREPARING,
+    ENCRYPTING,
+    TRANSFERRING,
+    FINISHING_ON_PC
+}
+
 sealed class FileTransferState {
     data object Idle : FileTransferState()
-    data class Preparing(val fileName: String) : FileTransferState()
+    data class Preparing(
+        val fileName: String,
+        val phase: TransferPhase = TransferPhase.PREPARING
+    ) : FileTransferState()
     data class Transferring(
         val currentFileIndex: Int,
         val totalFiles: Int,
@@ -91,12 +101,14 @@ sealed class FileTransferState {
         val overallProgress: Float,      // 0.0 - 1.0
         val bytesTransferred: Long,
         val totalBytes: Long,
-        val speedBytesPerSec: Long
+        val speedBytesPerSec: Long,
+        val phase: TransferPhase = TransferPhase.TRANSFERRING
     ) : FileTransferState()
     data class Completed(
         val totalFiles: Int,
         val totalBytes: Long,
-        val failedFiles: List<SelectedFileItem> = emptyList()
+        val failedFiles: List<SelectedFileItem> = emptyList(),
+        val primaryFileName: String? = null
     ) : FileTransferState()
     data class Failed(val error: String, val failedFiles: List<SelectedFileItem> = emptyList()) : FileTransferState()
     data object Cancelled : FileTransferState()

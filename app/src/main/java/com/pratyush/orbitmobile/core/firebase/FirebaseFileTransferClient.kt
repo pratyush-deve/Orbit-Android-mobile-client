@@ -8,6 +8,7 @@ import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ValueEventListener
 import com.pratyush.orbitmobile.core.common.OrbitResult
+import com.pratyush.orbitmobile.domain.model.TransferPhase
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -58,7 +59,8 @@ class FirebaseFileTransferClient(
         fileSize: Long,
         mimeType: String,
         isCancelled: () -> Boolean,
-        onProgress: (bytesTransferred: Long, totalBytes: Long) -> Unit
+        onProgress: (bytesTransferred: Long, totalBytes: Long) -> Unit,
+        onPhaseChanged: ((TransferPhase) -> Unit)? = null
     ): OrbitResult<Unit> = withContext(Dispatchers.IO) {
         if (fileSize < 0 || fileSize > FileTransferCrypto.MAX_REMOTE_FILE_SIZE_BYTES) {
             return@withContext OrbitResult.Error(
@@ -91,6 +93,7 @@ class FirebaseFileTransferClient(
 
         try {
             // 1. Encrypt SAF stream incrementally to temp file (never loads full file into memory)
+            onPhaseChanged?.invoke(TransferPhase.ENCRYPTING)
             val encryptResult = context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 FileOutputStream(encTempFile).use { outputStream ->
                     FileTransferCrypto.encryptStream(
@@ -111,6 +114,7 @@ class FirebaseFileTransferClient(
             val encryptedSize = encryptResult.encryptedSize
 
             // 2. Resumable upload to Firebase Storage
+            onPhaseChanged?.invoke(TransferPhase.TRANSFERRING)
             val uploaded = uploadResumableWithRetry(
                 encFile = encTempFile,
                 storagePath = storagePath,
@@ -126,6 +130,7 @@ class FirebaseFileTransferClient(
                 )
             }
             uploadedToStorage = true
+            onPhaseChanged?.invoke(TransferPhase.FINISHING_ON_PC)
 
             // 3. Attach ack listener BEFORE publishing event to avoid race
             val ackDeferred = CompletableDeferred<Pair<String, String?>>()

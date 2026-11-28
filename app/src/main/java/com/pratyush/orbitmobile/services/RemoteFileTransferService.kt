@@ -10,22 +10,45 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.pratyush.orbitmobile.MainActivity
 import com.pratyush.orbitmobile.OrbitMobileApp
-import com.pratyush.orbitmobile.R
+import com.pratyush.orbitmobile.core.navigation.AppRoute
+import com.pratyush.orbitmobile.domain.model.FileTransferState
+import com.pratyush.orbitmobile.domain.model.TransferPhase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import java.util.UUID
 
 /**
- * User-visible foreground service (foregroundServiceType="dataSync") active ONLY while
- * a remote file transfer is running, ensuring Android 17 / ColorOS 17 does not throttle
- * or freeze network sockets during backgrounded uploads.
+ * User-visible foreground service (foregroundServiceType="dataSync") active while
+ * a LAN or Firebase file transfer is running. Renders Android 16+ Live Updates
+ * (ProgressStyle + promoted ongoing request) on API 36+ and falls back to a standard
+ * ongoing progress notification on Android 8-15.
  */
 class RemoteFileTransferService : Service() {
 
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + serviceJob)
+    private var stateObserverJob: Job? = null
+    private val throttler = TransferNotificationThrottler()
+    private val speedEtaEstimator = TransferSpeedEtaEstimator()
+
+    @Volatile
+    private var hasObservedActiveState = false
+
+    @Volatile
+    private var activeNotificationSessionId: String = UUID.randomUUID().toString()
+
     companion object {
         private const val CHANNEL_ID = "orbit_remote_transfer_channel"
+        private const val RESULT_CHANNEL_ID = "orbit_remote_transfer_result_channel"
         private const val NOTIFICATION_ID = 4102
+        private const val RESULT_NOTIFICATION_ID = 4103
         private const val ACTION_START = "com.pratyush.orbitmobile.action.REMOTE_TRANSFER_START"
         private const val ACTION_UPDATE = "com.pratyush.orbitmobile.action.REMOTE_TRANSFER_UPDATE"
         private const val ACTION_STOP = "com.pratyush.orbitmobile.action.REMOTE_TRANSFER_STOP"
@@ -34,6 +57,7 @@ class RemoteFileTransferService : Service() {
         private const val EXTRA_TITLE = "extra_title"
         private const val EXTRA_DETAIL = "extra_detail"
         private const val EXTRA_PROGRESS = "extra_progress"
+        private const val EXTRA_SESSION_ID = "extra_session_id"
 
         fun start(context: Context, title: String, detail: String, progressPercent: Int = -1) {
             val intent = Intent(context, RemoteFileTransferService::class.java).apply {
@@ -76,26 +100,47 @@ class RemoteFileTransferService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        createChannels()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CANCEL -> {
-                (application as? OrbitMobileApp)?.appContainer?.fileTransferRepository?.cancelTransfer()
-                stopSelfSafe()
+                val requestSessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+                if (requestSessionId == null || requestSessionId == activeNotificationSessionId) {
+                    (application as? OrbitMobileApp)?.appContainer?.fileTransferRepository?.cancelTransfer()
+                    stopSelfSafe()
+                }
                 return START_NOT_STICKY
             }
             ACTION_STOP -> {
-                stopSelfSafe()
+                val isActive = (application as? OrbitMobileApp)
+                    ?.appContainer
+                    ?.fileTransferRepository
+                    ?.isTransferActive() == true
+                if (!isActive) {
+                    stopSelfSafe()
+                }
                 return START_NOT_STICKY
             }
             ACTION_START, ACTION_UPDATE -> {
                 val title = intent.getStringExtra(EXTRA_TITLE) ?: "Sending files to PC"
-                val detail = intent.getStringExtra(EXTRA_DETAIL) ?: "Uploading encrypted file..."
+                val detail = intent.getStringExtra(EXTRA_DETAIL) ?: "Preparing transfer..."
                 val progress = intent.getIntExtra(EXTRA_PROGRESS, -1)
-                val notification = buildNotification(title, detail, progress)
                 if (intent.action == ACTION_START) {
+                    activeNotificationSessionId = UUID.randomUUID().toString()
+                    hasObservedActiveState = false
+                    throttler.reset()
+                    speedEtaEstimator.reset()
+                    val content = TransferNotificationContent(
+                        title = title,
+                        detail = detail,
+                        shortCriticalText = if (progress in 0..100) "$progress%" else "Prep",
+                        progressPercent = progress.coerceAtLeast(0),
+                        isIndeterminate = progress !in 0..100,
+                        phase = TransferPhase.PREPARING
+                    )
+                    val notification = buildOngoingNotification(content)
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         startForeground(
                             NOTIFICATION_ID,
@@ -105,13 +150,89 @@ class RemoteFileTransferService : Service() {
                     } else {
                         startForeground(NOTIFICATION_ID, notification)
                     }
+                    ensureObservingTransferState()
                 } else {
+                    val content = TransferNotificationContent(
+                        title = title,
+                        detail = detail,
+                        shortCriticalText = if (progress in 0..100) "$progress%" else "Prep",
+                        progressPercent = progress.coerceAtLeast(0),
+                        isIndeterminate = progress !in 0..100,
+                        phase = if (progress in 0..100) TransferPhase.TRANSFERRING else TransferPhase.PREPARING
+                    )
                     val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                    nm?.notify(NOTIFICATION_ID, notification)
+                    nm?.notify(NOTIFICATION_ID, buildOngoingNotification(content))
                 }
             }
         }
         return START_NOT_STICKY
+    }
+
+    private fun ensureObservingTransferState() {
+        if (stateObserverJob?.isActive == true) return
+        val repo = (application as? OrbitMobileApp)?.appContainer?.fileTransferRepository ?: return
+
+        stateObserverJob = serviceScope.launch {
+            repo.transferState.collect { state ->
+                when (state) {
+                    is FileTransferState.Preparing -> {
+                        hasObservedActiveState = true
+                        speedEtaEstimator.reset()
+                        if (throttler.shouldUpdate(state)) {
+                            val content = TransferNotificationThrottler.formatContent(state)
+                            if (content != null) {
+                                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                                nm?.notify(NOTIFICATION_ID, buildOngoingNotification(content))
+                            }
+                        }
+                    }
+                    is FileTransferState.Transferring -> {
+                        hasObservedActiveState = true
+                        val snapshot = speedEtaEstimator.update(state.bytesTransferred, state.totalBytes)
+                        if (throttler.shouldUpdate(state)) {
+                            val smoothedSpeed = if (snapshot.smoothedSpeedBytesPerSec > 0L) {
+                                snapshot.smoothedSpeedBytesPerSec
+                            } else {
+                                state.speedBytesPerSec
+                            }
+                            val content = TransferNotificationThrottler.formatContent(
+                                state = state,
+                                smoothedSpeedBytesPerSec = smoothedSpeed,
+                                etaSeconds = snapshot.etaSeconds
+                            )
+                            if (content != null) {
+                                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                                nm?.notify(NOTIFICATION_ID, buildOngoingNotification(content))
+                            }
+                        }
+                    }
+                    is FileTransferState.Completed,
+                    is FileTransferState.Failed -> {
+                        if (hasObservedActiveState && !repo.isTransferActive()) {
+                            stopSelfSafe()
+                            postTerminalNotification(state)
+                        }
+                    }
+                    is FileTransferState.Cancelled -> {
+                        if (hasObservedActiveState && !repo.isTransferActive()) {
+                            stopSelfSafe()
+                        }
+                    }
+                    is FileTransferState.Idle -> Unit
+                }
+            }
+        }
+    }
+
+    private fun postTerminalNotification(state: FileTransferState) {
+        val terminal = TransferNotificationBuilder.buildTerminalNotification(
+            context = this,
+            channelId = RESULT_CHANNEL_ID,
+            state = state,
+            openIntent = createOpenSendFilesPendingIntent()
+        ) ?: return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        nm.notify(RESULT_NOTIFICATION_ID, terminal)
     }
 
     private fun stopSelfSafe() {
@@ -124,51 +245,68 @@ class RemoteFileTransferService : Service() {
         stopSelf()
     }
 
-    private fun createChannel() {
+    override fun onDestroy() {
+        stateObserverJob?.cancel()
+        serviceJob.cancel()
+        super.onDestroy()
+    }
+
+    private fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-            val channel = NotificationChannel(
+            val ongoingChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Remote File Transfers",
+                "File Transfers",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows progress for encrypted remote file transfers to ORBIT Windows"
+                description = "Shows live progress for ORBIT file transfers"
+                setShowBadge(false)
             }
-            nm.createNotificationChannel(channel)
+            val resultChannel = NotificationChannel(
+                RESULT_CHANNEL_ID,
+                "File Transfer Results",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifies when a file transfer completes or fails"
+            }
+            nm.createNotificationChannel(ongoingChannel)
+            nm.createNotificationChannel(resultChannel)
         }
     }
 
-    private fun buildNotification(title: String, detail: String, progressPercent: Int): Notification {
-        val openIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val cancelIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, RemoteFileTransferService::class.java).apply { action = ACTION_CANCEL },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.orbit_logo)
-            .setContentTitle(title)
-            .setContentText(detail)
-            .setContentIntent(openIntent)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .addAction(0, "Cancel", cancelIntent)
-
-        if (progressPercent in 0..100) {
-            builder.setProgress(100, progressPercent, false)
-        } else {
-            builder.setProgress(0, 0, true)
+    private fun createOpenSendFilesPendingIntent(): PendingIntent {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(MainActivity.EXTRA_OPEN_ROUTE, AppRoute.SendFiles.route)
         }
-        return builder.build()
+        return PendingIntent.getActivity(
+            this,
+            101,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun createCancelPendingIntent(): PendingIntent {
+        val cancelIntent = Intent(this, RemoteFileTransferService::class.java).apply {
+            action = ACTION_CANCEL
+            putExtra(EXTRA_SESSION_ID, activeNotificationSessionId)
+        }
+        return PendingIntent.getService(
+            this,
+            activeNotificationSessionId.hashCode(),
+            cancelIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun buildOngoingNotification(content: TransferNotificationContent): Notification {
+        return TransferNotificationBuilder.buildOngoingNotification(
+            context = this,
+            channelId = CHANNEL_ID,
+            content = content,
+            openIntent = createOpenSendFilesPendingIntent(),
+            cancelIntent = createCancelPendingIntent()
+        )
     }
 }

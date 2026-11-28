@@ -45,9 +45,7 @@ class SendFilesViewModel(
     }
 
     fun onStartSend() {
-        viewModelScope.launch {
-            fileTransferRepository.startTransfer()
-        }
+        fileTransferRepository.initiateTransfer()
     }
 
     fun onCancelTransfer() {

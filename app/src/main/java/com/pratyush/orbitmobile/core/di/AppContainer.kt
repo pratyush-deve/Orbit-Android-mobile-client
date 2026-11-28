@@ -197,11 +197,16 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
         )
     }
 
+    private val applicationScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    )
+
     override val fileTransferRepository: com.pratyush.orbitmobile.domain.repository.FileTransferRepository by lazy {
         com.pratyush.orbitmobile.data.repository.implementations.FileTransferRepositoryImpl(
             context = appContext,
             connectionRepository = connectionRepository,
             remoteDataSource = remoteDataSource,
+            scope = applicationScope,
             firebaseFileTransferClient = firebaseFileTransferClient
         )
     }

@@ -15,9 +15,13 @@ interface FileTransferRepository {
     fun removeFile(fileId: String)
     fun clearFiles()
 
+    fun initiateTransfer(): Boolean = false
     suspend fun startTransfer(): OrbitResult<Unit>
     fun cancelTransfer()
     fun resetTransferState()
+    fun isTransferActive(): Boolean =
+        transferState.value is FileTransferState.Preparing ||
+            transferState.value is FileTransferState.Transferring
 
     suspend fun fetchReceivedFiles(): OrbitResult<List<ReceivedRemoteFile>>
 }

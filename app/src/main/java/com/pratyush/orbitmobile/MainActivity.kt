@@ -1,6 +1,7 @@
 package com.pratyush.orbitmobile
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -8,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.pratyush.orbitmobile.core.designsystem.theme.OrbitTheme
@@ -21,6 +23,12 @@ import kotlinx.coroutines.launch
  */
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        const val EXTRA_OPEN_ROUTE = "extra_open_route"
+    }
+
+    private val pendingNavigationRoute = mutableStateOf<String?>(null)
+
     private val requestNotificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
             // Notification permission granted or declined
@@ -31,6 +39,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         checkAndRequestPermissions()
+        pendingNavigationRoute.value = intent?.getStringExtra(EXTRA_OPEN_ROUTE)
 
         val appContainer = (application as OrbitMobileApp).appContainer
 
@@ -44,8 +53,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             OrbitTheme {
-                AppNavigation(appContainer = appContainer)
+                AppNavigation(
+                    appContainer = appContainer,
+                    pendingRoute = pendingNavigationRoute.value,
+                    onPendingRouteConsumed = { pendingNavigationRoute.value = null }
+                )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val route = intent.getStringExtra(EXTRA_OPEN_ROUTE)
+        if (!route.isNullOrBlank()) {
+            pendingNavigationRoute.value = route
         }
     }
 

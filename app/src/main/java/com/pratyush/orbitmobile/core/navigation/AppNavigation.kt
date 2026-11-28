@@ -69,7 +69,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun AppNavigation(
     appContainer: AppContainer,
     modifier: Modifier = Modifier,
-    navController: NavHostController = rememberNavController()
+    navController: NavHostController = rememberNavController(),
+    pendingRoute: String? = null,
+    onPendingRouteConsumed: () -> Unit = {}
 ) {
     val navActions = remember(navController) { NavigationActions(navController) }
     val viewModelFactory = remember(appContainer) { ViewModelFactory(appContainer) }
@@ -88,6 +90,15 @@ fun AppNavigation(
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(400L)
         isStartupSplashVisible = false
+    }
+
+    LaunchedEffect(pendingRoute) {
+        if (!pendingRoute.isNullOrBlank()) {
+            navController.navigate(pendingRoute) {
+                launchSingleTop = true
+            }
+            onPendingRouteConsumed()
+        }
     }
 
     // Observe global connection state
