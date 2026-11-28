@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Shield
@@ -31,6 +33,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -68,10 +72,12 @@ fun AiDrawerContent(
     onSearchChanged: (String) -> Unit,
     onSelectConversation: (String) -> Unit,
     onNewChat: () -> Unit,
+    onRenameConversation: (String, String) -> Unit,
     onDeleteConversation: (String) -> Unit,
     onSetPolicy: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var conversationToRename by remember { mutableStateOf<AiConversation?>(null) }
     var conversationToDelete by remember { mutableStateOf<AiConversation?>(null) }
     var showPolicyDialog by remember { mutableStateOf(false) }
 
@@ -198,6 +204,7 @@ fun AiDrawerContent(
                         conversation = conv,
                         isSelected = isSelected,
                         onClick = { onSelectConversation(conv.id) },
+                        onRename = { conversationToRename = conv },
                         onDelete = { conversationToDelete = conv }
                     )
                 }
@@ -251,6 +258,58 @@ fun AiDrawerContent(
                 }
             }
         }
+    }
+
+    // Rename conversation dialog
+    conversationToRename?.let { conv ->
+        var editedTitle by remember(conv.id) { mutableStateOf(conv.title) }
+        val trimmedTitle = editedTitle.trim()
+        val canSave = trimmedTitle.isNotEmpty() && trimmedTitle != conv.title
+
+        AlertDialog(
+            onDismissRequest = { conversationToRename = null },
+            title = {
+                Text(text = "Rename Conversation", color = Color.White)
+            },
+            text = {
+                OutlinedTextField(
+                    value = editedTitle,
+                    onValueChange = { editedTitle = it },
+                    label = {
+                        Text("Title", color = OrbitColors.TextTertiary)
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = Color(0xFF14141E),
+                        unfocusedContainerColor = Color(0xFF14141E),
+                        focusedBorderColor = OrbitColors.PurplePrimary,
+                        unfocusedBorderColor = OrbitColors.BorderSubtle,
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White
+                    )
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onRenameConversation(conv.id, trimmedTitle)
+                        conversationToRename = null
+                    },
+                    enabled = canSave,
+                    colors = ButtonDefaults.buttonColors(containerColor = OrbitColors.PurplePrimary)
+                ) {
+                    Text("Save", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { conversationToRename = null }) {
+                    Text("Cancel", color = OrbitColors.TextSecondary)
+                }
+            },
+            containerColor = Color(0xFF181822)
+        )
     }
 
     // Delete confirmation dialog
@@ -395,10 +454,12 @@ private fun ConversationDrawerItem(
     conversation: AiConversation,
     isSelected: Boolean,
     onClick: () -> Unit,
+    onRename: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isDesktop = conversation.origin.equals("desktop", ignoreCase = true)
+    var menuExpanded by remember { mutableStateOf(false) }
 
     Row(
         modifier = modifier
@@ -443,16 +504,65 @@ private fun ConversationDrawerItem(
             }
         }
 
-        IconButton(
-            onClick = onDelete,
-            modifier = Modifier.size(24.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Filled.DeleteOutline,
-                contentDescription = "Delete",
-                tint = OrbitColors.TextTertiary,
-                modifier = Modifier.size(16.dp)
-            )
+        Box {
+            IconButton(
+                onClick = { menuExpanded = true },
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.MoreVert,
+                    contentDescription = "Conversation options",
+                    tint = OrbitColors.TextTertiary,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+
+            DropdownMenu(
+                expanded = menuExpanded,
+                onDismissRequest = { menuExpanded = false },
+                containerColor = Color(0xFF181822)
+            ) {
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = "Rename",
+                            color = OrbitColors.TextPrimary
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Filled.Edit,
+                            contentDescription = null,
+                            tint = OrbitColors.PurpleSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onRename()
+                    }
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = "Delete",
+                            color = OrbitColors.StatusOffline
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteOutline,
+                            contentDescription = null,
+                            tint = OrbitColors.StatusOffline,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onDelete()
+                    }
+                )
+            }
         }
     }
 }

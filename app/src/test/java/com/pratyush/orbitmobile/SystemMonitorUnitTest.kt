@@ -122,15 +122,6 @@ class SystemMonitorUnitTest {
         override suspend fun sendTrackpadEvents(host: String, port: Int, authToken: String, events: List<TrackpadInputEvent>) = OrbitResult.Success(Unit)
         override suspend fun releaseAllTrackpadButtons(host: String, port: Int, authToken: String) = OrbitResult.Success(Unit)
 
-        override suspend fun fetchAiStatus(host: String, port: Int, authToken: String) = OrbitResult.Success(com.pratyush.orbitmobile.domain.model.AcpStatus())
-        override suspend fun fetchAiConversations(host: String, port: Int, authToken: String) = OrbitResult.Success(emptyList<com.pratyush.orbitmobile.domain.model.AiConversation>())
-        override suspend fun createAiConversation(host: String, port: Int, authToken: String, title: String?, conversationId: String?) = OrbitResult.Error(Exception("Not used"))
-        override suspend fun fetchAiConversation(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Error(Exception("Not used"))
-        override suspend fun deleteAiConversation(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Success(Unit)
-        override suspend fun streamAiPrompt(host: String, port: Int, authToken: String, conversationId: String, prompt: String, userMessageId: String?, assistantMessageId: String?, onEvent: (com.pratyush.orbitmobile.domain.model.AiStreamEvent) -> Unit) = OrbitResult.Success(Unit)
-        override suspend fun resolveAiPermission(host: String, port: Int, authToken: String, requestId: String, optionId: String) = OrbitResult.Success(true)
-        override suspend fun setAiPolicy(host: String, port: Int, authToken: String, policy: String) = OrbitResult.Success(Unit)
-        override suspend fun cancelAiPrompt(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Success(Unit)
 
         override suspend fun fetchSystemStats(host: String, port: Int, authToken: String): OrbitResult<SystemTelemetry> {
             fetchCount++

@@ -259,15 +259,6 @@ class TrackpadUnitTest {
         override fun listenToControlEvents(host: String, port: Int, authToken: String) = kotlinx.coroutines.flow.emptyFlow<com.pratyush.orbitmobile.domain.model.ControlEvent>()
         override suspend fun fetchSystemStats(host: String, port: Int, authToken: String) = OrbitResult.Error(Exception("Not used"))
 
-        override suspend fun fetchAiStatus(host: String, port: Int, authToken: String) = OrbitResult.Success(com.pratyush.orbitmobile.domain.model.AcpStatus())
-        override suspend fun fetchAiConversations(host: String, port: Int, authToken: String) = OrbitResult.Success(emptyList<com.pratyush.orbitmobile.domain.model.AiConversation>())
-        override suspend fun createAiConversation(host: String, port: Int, authToken: String, title: String?, conversationId: String?) = OrbitResult.Error(Exception("Not used"))
-        override suspend fun fetchAiConversation(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Error(Exception("Not used"))
-        override suspend fun deleteAiConversation(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Success(Unit)
-        override suspend fun streamAiPrompt(host: String, port: Int, authToken: String, conversationId: String, prompt: String, userMessageId: String?, assistantMessageId: String?, onEvent: (com.pratyush.orbitmobile.domain.model.AiStreamEvent) -> Unit) = OrbitResult.Success(Unit)
-        override suspend fun resolveAiPermission(host: String, port: Int, authToken: String, requestId: String, optionId: String) = OrbitResult.Success(true)
-        override suspend fun setAiPolicy(host: String, port: Int, authToken: String, policy: String) = OrbitResult.Success(Unit)
-        override suspend fun cancelAiPrompt(host: String, port: Int, authToken: String, conversationId: String) = OrbitResult.Success(Unit)
     }
 
     @Test

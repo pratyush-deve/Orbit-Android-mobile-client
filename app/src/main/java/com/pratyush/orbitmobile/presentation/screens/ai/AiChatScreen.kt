@@ -4,6 +4,8 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,13 +41,20 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -69,11 +78,95 @@ fun AiChatScreen(
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val snackbarHostState = remember { SnackbarHostState() }
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
 
-    // Auto-scroll to bottom on new message or during streaming updates
-    LaunchedEffect(uiState.messages.size, uiState.messages.lastOrNull()?.content?.length) {
+    var shouldAutoScroll by remember { mutableStateOf(true) }
+    var isProgrammaticScroll by remember { mutableStateOf(false) }
+
+    val isAtBottom by remember {
+        derivedStateOf {
+            val layoutInfo = listState.layoutInfo
+            val totalItems = layoutInfo.totalItemsCount
+            if (totalItems == 0) return@derivedStateOf true
+            val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
+            lastVisibleItem.index >= totalItems - 2 &&
+                (lastVisibleItem.offset + lastVisibleItem.size) <= (layoutInfo.viewportEndOffset + 80)
+        }
+    }
+
+    // Detect deliberate user drag/scroll: pause auto-scroll when scrolling up,
+    // and clear keyboard focus when interacting with the message list.
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) {
+                focusManager.clearFocus()
+                keyboardController?.hide()
+                if (!isAtBottom) {
+                    shouldAutoScroll = false
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to isAtBottom }.collect { (scrolling, atBottom) ->
+            if (!isProgrammaticScroll) {
+                if (atBottom) {
+                    shouldAutoScroll = true
+                } else if (scrolling) {
+                    shouldAutoScroll = false
+                }
+            }
+        }
+    }
+
+    // Jump to bottom when switching conversations
+    LaunchedEffect(uiState.currentConversationId) {
+        shouldAutoScroll = true
         if (uiState.messages.isNotEmpty()) {
-            listState.animateScrollToItem(uiState.messages.lastIndex)
+            isProgrammaticScroll = true
+            try {
+                listState.scrollToItem(uiState.messages.size)
+            } finally {
+                isProgrammaticScroll = false
+            }
+        }
+    }
+
+    // Auto-scroll when new messages are added (e.g. user sends a message)
+    LaunchedEffect(uiState.messages.size) {
+        if (uiState.messages.isNotEmpty()) {
+            val lastMsg = uiState.messages.lastOrNull()
+            if (lastMsg?.role.equals("user", ignoreCase = true)) {
+                shouldAutoScroll = true
+            }
+            if (shouldAutoScroll) {
+                isProgrammaticScroll = true
+                try {
+                    listState.animateScrollToItem(uiState.messages.size)
+                } finally {
+                    isProgrammaticScroll = false
+                }
+            }
+        }
+    }
+
+    // Keep latest streaming content and tool activities visible without animation jitter
+    val lastMessage = uiState.messages.lastOrNull()
+    LaunchedEffect(
+        lastMessage?.content?.length,
+        lastMessage?.toolActivities?.size,
+        lastMessage?.toolActivities?.lastOrNull()?.status,
+        uiState.pendingPermissionRequest
+    ) {
+        if (uiState.messages.isNotEmpty() && shouldAutoScroll) {
+            isProgrammaticScroll = true
+            try {
+                listState.scrollToItem(uiState.messages.size)
+            } finally {
+                isProgrammaticScroll = false
+            }
         }
     }
 
@@ -106,6 +199,7 @@ fun AiChatScreen(
                         viewModel.newChat()
                         scope.launch { drawerState.close() }
                     },
+                    onRenameConversation = viewModel::renameConversation,
                     onDeleteConversation = viewModel::deleteConversation,
                     onSetPolicy = viewModel::setPermissionPolicy
                 )
@@ -125,6 +219,8 @@ fun AiChatScreen(
                     activeModel = uiState.acpStatus.activeModel,
                     onBackClick = onNavigateBack,
                     onMenuClick = {
+                        focusManager.clearFocus()
+                        keyboardController?.hide()
                         scope.launch {
                             if (drawerState.isClosed) drawerState.open() else drawerState.close()
                         }
@@ -160,12 +256,22 @@ fun AiChatScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onTap = {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            }
+                        )
+                    }
             ) {
                 if (uiState.messages.isEmpty()) {
                     // Welcome & Empty State
                     AiEmptyState(
                         isAcpAvailable = uiState.acpStatus.isAvailable,
                         onPromptSelected = { prompt ->
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
                             viewModel.onInputChanged(prompt)
                             viewModel.sendMessage()
                         }

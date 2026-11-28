@@ -24,6 +24,7 @@ interface AiChatRepository {
     suspend fun refreshConversations()
     suspend fun selectConversation(conversationId: String)
     suspend fun createNewConversation(title: String? = null): OrbitResult<AiConversation>
+    suspend fun renameConversation(conversationId: String, newTitle: String): OrbitResult<Unit>
     suspend fun deleteConversation(conversationId: String): OrbitResult<Unit>
     suspend fun sendMessage(content: String): OrbitResult<Unit>
     suspend fun resolvePermission(optionId: String): OrbitResult<Boolean>

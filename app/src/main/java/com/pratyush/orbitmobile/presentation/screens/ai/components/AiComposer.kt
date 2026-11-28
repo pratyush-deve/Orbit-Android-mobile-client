@@ -25,10 +25,17 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
@@ -44,6 +51,10 @@ fun AiComposer(
     onCancelActiveGeneration: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var wasFocused by remember { mutableStateOf(false) }
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -85,6 +96,12 @@ fun AiComposer(
                 modifier = Modifier
                     .weight(1f)
                     .padding(end = 8.dp)
+                    .onFocusChanged { focusState ->
+                        if (wasFocused && !focusState.isFocused) {
+                            keyboardController?.hide()
+                        }
+                        wasFocused = focusState.isFocused
+                    }
             )
 
             if (isStreaming) {
@@ -117,7 +134,11 @@ fun AiComposer(
                     contentAlignment = Alignment.Center
                 ) {
                     IconButton(
-                        onClick = onSendMessage,
+                        onClick = {
+                            onSendMessage()
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        },
                         enabled = canSend
                     ) {
                         Icon(

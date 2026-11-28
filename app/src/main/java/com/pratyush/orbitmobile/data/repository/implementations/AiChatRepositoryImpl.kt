@@ -5,15 +5,18 @@ import com.pratyush.orbitmobile.core.common.OrbitResult
 import com.pratyush.orbitmobile.data.local.database.OrbitDatabase
 import com.pratyush.orbitmobile.data.local.database.entity.AiConversationEntity
 import com.pratyush.orbitmobile.data.local.database.entity.AiMessageEntity
+import com.pratyush.orbitmobile.data.local.database.entity.AiPendingOpEntity
 import com.pratyush.orbitmobile.data.local.database.entity.AiToolActivityEntity
-import com.pratyush.orbitmobile.data.remote.RemoteDataSource
+import com.pratyush.orbitmobile.data.remote.ai.RoutingAiTransport
 import com.pratyush.orbitmobile.domain.model.AcpStatus
 import com.pratyush.orbitmobile.domain.model.AiConversation
 import com.pratyush.orbitmobile.domain.model.AiMessage
 import com.pratyush.orbitmobile.domain.model.AiPermissionRequest
 import com.pratyush.orbitmobile.domain.model.AiToolActivity
 import com.pratyush.orbitmobile.domain.model.ConnectionState
+import com.pratyush.orbitmobile.domain.model.EffectiveConnectionState
 import com.pratyush.orbitmobile.domain.repository.AiChatRepository
+import com.pratyush.orbitmobile.domain.repository.AiTransport
 import com.pratyush.orbitmobile.domain.repository.ConnectionRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,17 +29,19 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.util.UUID
 
 /**
  * Production implementation of [AiChatRepository].
- * Local persistence via [OrbitDatabase] (Room/SQLite), live LAN synchronization with Windows ACP,
+ * Local persistence via [OrbitDatabase] (Room/SQLite), live synchronization via [AiTransport],
  * and zero fallback to mock models.
  */
 class AiChatRepositoryImpl(
     private val connectionRepository: ConnectionRepository,
-    private val remoteDataSource: RemoteDataSource,
+    private val aiTransport: AiTransport,
     private val database: OrbitDatabase,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) : AiChatRepository {
@@ -63,8 +68,14 @@ class AiChatRepositoryImpl(
 
     private var statusPollJob: Job? = null
     private var streamingJob: Job? = null
+    private val outboxMutex = Mutex()
 
     init {
+        // Recover any outbox ops left in_flight across app restart
+        scope.launch {
+            database.aiChatDao().resetInFlightPendingOps()
+        }
+
         // 1. Observe local SQLite database for instant cached UI rendering
         scope.launch {
             database.aiChatDao().getConversationsFlow().collectLatest { entities ->
@@ -91,26 +102,55 @@ class AiChatRepositoryImpl(
             }
         }
 
-        // 2. Observe connection state: when connected, sync with Windows
+        // 2. Observe effective connection state (LAN priority + Firebase remote fallback)
         scope.launch {
-            connectionRepository.connectionState.collect { state ->
-                if (state is ConnectionState.Connected) {
-                    startStatusMonitoring()
-                    refreshConversations()
-                } else {
-                    stopStatusMonitoring()
-                    _acpStatus.update { it.copy(isAvailable = false, state = "unavailable") }
+            val routing = aiTransport as? RoutingAiTransport
+            if (routing != null) {
+                routing.effectiveConnectionState.collect { state ->
+                    if (state.isConnected) {
+                        val intervalMs = if (state is EffectiveConnectionState.ConnectedRemote) 12000L else 4000L
+                        startStatusMonitoring(intervalMs)
+                        launch { replayPendingOps() }
+                        refreshConversations()
+                        val activeId = _currentConversationId.value
+                        if (activeId != null && !_isStreaming.value) {
+                            selectConversation(activeId)
+                        }
+                    } else {
+                        stopStatusMonitoring()
+                        _acpStatus.update { it.copy(isAvailable = false, state = "unavailable") }
+                    }
+                }
+            } else {
+                connectionRepository.connectionState.collect { state ->
+                    if (state is ConnectionState.Connected) {
+                        startStatusMonitoring(4000L)
+                        launch { replayPendingOps() }
+                        refreshConversations()
+                    } else {
+                        stopStatusMonitoring()
+                        _acpStatus.update { it.copy(isAvailable = false, state = "unavailable") }
+                    }
                 }
             }
         }
     }
 
-    private fun startStatusMonitoring() {
+    private fun isTransportConnected(): Boolean {
+        val routing = aiTransport as? RoutingAiTransport
+        return if (routing != null) {
+            routing.effectiveConnectionState.value.isConnected
+        } else {
+            connectionRepository.connectionState.value is ConnectionState.Connected
+        }
+    }
+
+    private fun startStatusMonitoring(intervalMs: Long = 4000L) {
         statusPollJob?.cancel()
         statusPollJob = scope.launch {
             while (isActive) {
                 refreshStatus()
-                delay(4000L)
+                delay(intervalMs)
             }
         }
     }
@@ -121,11 +161,9 @@ class AiChatRepositoryImpl(
     }
 
     override suspend fun refreshStatus() {
-        val host = connectionRepository.activeHost ?: return
-        val port = connectionRepository.activePort ?: return
-        val token = connectionRepository.activeAuthToken ?: return
+        if (!isTransportConnected()) return
 
-        when (val result = remoteDataSource.fetchAiStatus(host, port, token)) {
+        when (val result = aiTransport.getStatus()) {
             is OrbitResult.Success -> {
                 _acpStatus.value = result.data
             }
@@ -137,13 +175,15 @@ class AiChatRepositoryImpl(
     }
 
     override suspend fun refreshConversations() {
-        val host = connectionRepository.activeHost ?: return
-        val port = connectionRepository.activePort ?: return
-        val token = connectionRepository.activeAuthToken ?: return
+        if (!isTransportConnected()) return
 
-        when (val result = remoteDataSource.fetchAiConversations(host, port, token)) {
+        when (val result = aiTransport.getConversations()) {
             is OrbitResult.Success -> {
-                val remoteList = result.data
+                val pendingDeletes = database.aiChatDao().getPendingOps()
+                    .filter { it.opType == AiPendingOpEntity.OP_DELETE }
+                    .map { it.conversationId }
+                    .toSet()
+                val remoteList = result.data.filterNot { it.id in pendingDeletes }
                 val entities = remoteList.map { c ->
                     AiConversationEntity(
                         id = c.id,
@@ -174,12 +214,10 @@ class AiChatRepositoryImpl(
         loadMessagesFromDb(conversationId)
 
         // 2. Fetch authoritative transcript from Windows if connected
-        val host = connectionRepository.activeHost ?: return
-        val port = connectionRepository.activePort ?: return
-        val token = connectionRepository.activeAuthToken ?: return
+        if (!isTransportConnected()) return
 
         scope.launch {
-            when (val result = remoteDataSource.fetchAiConversation(host, port, token, conversationId)) {
+            when (val result = aiTransport.getConversation(conversationId)) {
                 is OrbitResult.Success -> {
                     val (_, remoteMessages) = result.data
                     val entities = remoteMessages.map { m ->
@@ -284,40 +322,57 @@ class AiChatRepositoryImpl(
 
         selectConversation(newId)
 
-        // Sync with Windows passing the exact same newId
-        val host = connectionRepository.activeHost
-        val port = connectionRepository.activePort
-        val token = connectionRepository.activeAuthToken
+        // Enqueue in persistent outbox before attempting network delivery
+        val createPayload = JSONObject().apply {
+            if (title != null) put("title", title)
+        }.toString()
+        database.aiChatDao().enqueuePendingOp(
+            AiPendingOpEntity(
+                opId = "create:$newId",
+                conversationId = newId,
+                opType = AiPendingOpEntity.OP_CREATE,
+                payloadJson = createPayload,
+                createdAtMs = now
+            )
+        )
 
-        if (host != null && port != null && token != null) {
+        // Sync with Windows passing the exact same newId
+        if (isTransportConnected()) {
             scope.launch {
-                when (val result = remoteDataSource.createAiConversation(host, port, token, title, conversationId = newId)) {
-                    is OrbitResult.Success -> {
-                        val remoteConv = result.data
-                        database.aiChatDao().upsertConversation(
-                            AiConversationEntity(
-                                id = remoteConv.id,
-                                title = remoteConv.title,
-                                backendId = remoteConv.backendId,
-                                workspacePath = remoteConv.workspacePath,
-                                createdAtUtc = remoteConv.createdAtUtc,
-                                updatedAtUtc = remoteConv.updatedAtUtc,
-                                isPinned = remoteConv.isPinned,
-                                isArchived = remoteConv.isArchived,
-                                origin = remoteConv.origin,
-                                isSynced = true
-                            )
-                        )
-                    }
-                    is OrbitResult.Error -> {
-                        Log.w(tag, "Remote creation failed: ${result.exception.message}")
-                    }
-                    else -> Unit
-                }
+                replayPendingOps()
             }
         }
 
         return OrbitResult.Success(localConv)
+    }
+
+    override suspend fun renameConversation(conversationId: String, newTitle: String): OrbitResult<Unit> {
+        val trimmedTitle = newTitle.trim()
+        if (trimmedTitle.isEmpty()) return OrbitResult.Error(Exception("Conversation title cannot be empty"))
+
+        val now = System.currentTimeMillis()
+        database.aiChatDao().updateConversationTitle(conversationId, trimmedTitle, updatedAtUtc = now, isSynced = false)
+
+        val renamePayload = JSONObject().apply {
+            put("title", trimmedTitle)
+        }.toString()
+        database.aiChatDao().enqueuePendingOp(
+            AiPendingOpEntity(
+                opId = "rename:$conversationId:$now",
+                conversationId = conversationId,
+                opType = AiPendingOpEntity.OP_RENAME,
+                payloadJson = renamePayload,
+                createdAtMs = now
+            )
+        )
+
+        if (isTransportConnected()) {
+            scope.launch {
+                replayPendingOps()
+            }
+        }
+
+        return OrbitResult.Success(Unit)
     }
 
     override suspend fun deleteConversation(conversationId: String): OrbitResult<Unit> {
@@ -327,26 +382,113 @@ class AiChatRepositoryImpl(
             _currentMessages.value = emptyList()
         }
 
-        val host = connectionRepository.activeHost
-        val port = connectionRepository.activePort
-        val token = connectionRepository.activeAuthToken
+        val now = System.currentTimeMillis()
+        database.aiChatDao().enqueuePendingOp(
+            AiPendingOpEntity(
+                opId = "delete:$conversationId",
+                conversationId = conversationId,
+                opType = AiPendingOpEntity.OP_DELETE,
+                payloadJson = "{}",
+                createdAtMs = now
+            )
+        )
 
-        if (host != null && port != null && token != null) {
+        if (isTransportConnected()) {
             scope.launch {
-                remoteDataSource.deleteAiConversation(host, port, token, conversationId)
+                replayPendingOps()
             }
         }
 
         return OrbitResult.Success(Unit)
     }
 
+    internal suspend fun replayPendingOps() {
+        if (!isTransportConnected()) return
+        outboxMutex.withLock {
+            val pending = database.aiChatDao().getPendingOps()
+            for (op in pending) {
+                if (!isTransportConnected()) break
+
+                database.aiChatDao().updatePendingOpStatus(
+                    op.opId,
+                    AiPendingOpEntity.STATUS_IN_FLIGHT,
+                    op.retryCount,
+                    op.lastError
+                )
+
+                val result: OrbitResult<*> = when (op.opType) {
+                    AiPendingOpEntity.OP_CREATE -> {
+                        val title = runCatching {
+                            val obj = JSONObject(op.payloadJson)
+                            if (obj.has("title") && !obj.isNull("title")) obj.getString("title") else null
+                        }.getOrNull()
+                        aiTransport.createConversation(title = title, conversationId = op.conversationId)
+                    }
+                    AiPendingOpEntity.OP_RENAME -> {
+                        val title = runCatching { JSONObject(op.payloadJson).optString("title", "") }.getOrDefault("")
+                        if (title.isBlank()) {
+                            OrbitResult.Error(IllegalArgumentException("Empty title"))
+                        } else {
+                            aiTransport.renameConversation(op.conversationId, title)
+                        }
+                    }
+                    AiPendingOpEntity.OP_DELETE -> {
+                        aiTransport.deleteConversation(op.conversationId)
+                    }
+                    else -> OrbitResult.Error(IllegalArgumentException("Unknown opType: ${op.opType}"))
+                }
+
+                when (result) {
+                    is OrbitResult.Success -> {
+                        database.aiChatDao().deletePendingOp(op.opId)
+                        if (op.opType == AiPendingOpEntity.OP_CREATE || op.opType == AiPendingOpEntity.OP_RENAME) {
+                            database.aiChatDao().getConversationById(op.conversationId)?.let { conv ->
+                                database.aiChatDao().upsertConversation(conv.copy(isSynced = true))
+                            }
+                        }
+                    }
+                    is OrbitResult.Error -> {
+                        val errMsg = result.exception.message ?: "Sync failed"
+                        val isPermanent = result.exception is IllegalArgumentException ||
+                            errMsg.contains("not found", ignoreCase = true) ||
+                            errMsg.contains("404") ||
+                            errMsg.contains("400")
+
+                        if (isPermanent && op.opType == AiPendingOpEntity.OP_DELETE) {
+                            // Already deleted on authoritative host
+                            database.aiChatDao().deletePendingOp(op.opId)
+                        } else if (isPermanent || op.retryCount + 1 >= MAX_OUTBOX_RETRIES) {
+                            database.aiChatDao().updatePendingOpStatus(
+                                op.opId,
+                                AiPendingOpEntity.STATUS_FAILED_PERMANENT,
+                                op.retryCount + 1,
+                                errMsg
+                            )
+                        } else {
+                            val nextRetry = op.retryCount + 1
+                            database.aiChatDao().updatePendingOpStatus(
+                                op.opId,
+                                AiPendingOpEntity.STATUS_PENDING,
+                                nextRetry,
+                                errMsg
+                            )
+                            val backoffMs = minOf(1000L * (1 shl nextRetry), 16000L)
+                            delay(backoffMs)
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
     override suspend fun sendMessage(content: String): OrbitResult<Unit> {
         val trimmed = content.trim()
         if (trimmed.isEmpty()) return OrbitResult.Success(Unit)
 
-        val host = connectionRepository.activeHost ?: return OrbitResult.Error(Exception("Not connected to Windows"))
-        val port = connectionRepository.activePort ?: return OrbitResult.Error(Exception("Not connected to Windows"))
-        val token = connectionRepository.activeAuthToken ?: return OrbitResult.Error(Exception("Unauthorized"))
+        if (!isTransportConnected()) {
+            return OrbitResult.Error(Exception("Not connected to Windows"))
+        }
 
         var convId = _currentConversationId.value
         if (convId == null) {
@@ -395,11 +537,9 @@ class AiChatRepositoryImpl(
         streamingJob?.cancel()
         streamingJob = scope.launch {
             val accumulated = StringBuilder()
+            val accumulatedThought = StringBuilder()
 
-            val streamResult = remoteDataSource.streamAiPrompt(
-                host = host,
-                port = port,
-                authToken = token,
+            val streamResult = aiTransport.streamPrompt(
                 conversationId = currentCId,
                 prompt = trimmed,
                 userMessageId = userMsgId,
@@ -413,6 +553,18 @@ class AiChatRepositoryImpl(
                                 list.map { msg ->
                                     if (msg.id == assistantMsgId) {
                                         msg.copy(content = accumulated.toString())
+                                    } else msg
+                                }
+                            }
+                        }
+
+                        "thought" -> {
+                            val thoughtChunk = event.text ?: ""
+                            accumulatedThought.append(thoughtChunk)
+                            _currentMessages.update { list ->
+                                list.map { msg ->
+                                    if (msg.id == assistantMsgId) {
+                                        msg.copy(thought = accumulatedThought.toString())
                                     } else msg
                                 }
                             }
@@ -483,6 +635,10 @@ class AiChatRepositoryImpl(
                             }
                         }
 
+                        "permission_approved" -> {
+                            _pendingPermissionRequest.value = null
+                        }
+
                         "complete" -> {
                             _pendingPermissionRequest.value = null
                             val finalText = event.text ?: accumulated.toString()
@@ -500,6 +656,42 @@ class AiChatRepositoryImpl(
                                     isSynced = true
                                 )
                                 loadMessagesFromDb(currentCId)
+                            }
+                        }
+
+                        "cancelled" -> {
+                            _pendingPermissionRequest.value = null
+                            scope.launch {
+                                database.aiChatDao().updateMessageContentAndStatus(
+                                    id = assistantMsgId,
+                                    content = accumulated.toString(),
+                                    status = "cancelled",
+                                    isSynced = true
+                                )
+                                loadMessagesFromDb(currentCId)
+                            }
+                        }
+
+                        "conversation_updated" -> {
+                            val updatedTitle = event.text
+                            if (!updatedTitle.isNullOrBlank()) {
+                                scope.launch {
+                                    database.aiChatDao().updateConversationTitle(
+                                        id = event.conversationId,
+                                        title = updatedTitle,
+                                        isSynced = true
+                                    )
+                                }
+                            }
+                        }
+
+                        "conversation_deleted" -> {
+                            scope.launch {
+                                database.aiChatDao().deleteConversation(event.conversationId)
+                                if (_currentConversationId.value == event.conversationId) {
+                                    _currentConversationId.value = null
+                                    _currentMessages.value = emptyList()
+                                }
                             }
                         }
 
@@ -538,21 +730,21 @@ class AiChatRepositoryImpl(
 
     override suspend fun resolvePermission(optionId: String): OrbitResult<Boolean> {
         val req = _pendingPermissionRequest.value ?: return OrbitResult.Error(Exception("No pending permission request"))
-        val host = connectionRepository.activeHost ?: return OrbitResult.Error(Exception("Not connected"))
-        val port = connectionRepository.activePort ?: return OrbitResult.Error(Exception("Not connected"))
-        val token = connectionRepository.activeAuthToken ?: return OrbitResult.Error(Exception("Unauthorized"))
+        if (!isTransportConnected()) {
+            return OrbitResult.Error(Exception("Not connected"))
+        }
 
         _pendingPermissionRequest.value = null
 
-        return remoteDataSource.resolveAiPermission(host, port, token, req.requestId, optionId)
+        return aiTransport.resolvePermission(req.requestId, optionId)
     }
 
     override suspend fun setPermissionPolicy(policy: String): OrbitResult<Unit> {
-        val host = connectionRepository.activeHost ?: return OrbitResult.Error(Exception("Not connected"))
-        val port = connectionRepository.activePort ?: return OrbitResult.Error(Exception("Not connected"))
-        val token = connectionRepository.activeAuthToken ?: return OrbitResult.Error(Exception("Unauthorized"))
+        if (!isTransportConnected()) {
+            return OrbitResult.Error(Exception("Not connected"))
+        }
 
-        val result = remoteDataSource.setAiPolicy(host, port, token, policy)
+        val result = aiTransport.setPolicy(policy)
         if (result is OrbitResult.Success) {
             _acpStatus.update { it.copy(permissionMode = policy) }
         }
@@ -561,20 +753,20 @@ class AiChatRepositoryImpl(
 
     override suspend fun cancelActiveGeneration() {
         val convId = _currentConversationId.value ?: return
-        val host = connectionRepository.activeHost ?: return
-        val port = connectionRepository.activePort ?: return
-        val token = connectionRepository.activeAuthToken ?: return
 
         streamingJob?.cancel()
         _isStreaming.value = false
         _pendingPermissionRequest.value = null
 
-        scope.launch {
-            remoteDataSource.cancelAiPrompt(host, port, token, convId)
+        if (isTransportConnected()) {
+            scope.launch {
+                aiTransport.cancelPrompt(convId)
+            }
         }
     }
 
     companion object {
+        private const val MAX_OUTBOX_RETRIES = 5
         private val TERMINAL_STATUSES = setOf("completed", "failed", "cancelled", "done", "error", "success")
 
         fun reconcileToolActivities(

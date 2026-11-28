@@ -8,6 +8,7 @@ import com.pratyush.orbitmobile.data.local.database.dao.AiChatDao
 import com.pratyush.orbitmobile.data.local.database.dao.DeviceDao
 import com.pratyush.orbitmobile.data.local.database.entity.AiConversationEntity
 import com.pratyush.orbitmobile.data.local.database.entity.AiMessageEntity
+import com.pratyush.orbitmobile.data.local.database.entity.AiPendingOpEntity
 import com.pratyush.orbitmobile.data.local.database.entity.AiToolActivityEntity
 import com.pratyush.orbitmobile.data.local.database.entity.DeviceEntity
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +24,7 @@ import kotlinx.coroutines.withContext
  * and asynchronous Flow updates.
  */
 class OrbitDatabaseHelper(context: Context) :
-    SQLiteOpenHelper(context, OrbitDatabase.DATABASE_NAME, null, 2),
+    SQLiteOpenHelper(context, OrbitDatabase.DATABASE_NAME, null, 3),
     OrbitDatabase {
 
     private val conversationChangeTrigger = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -98,6 +99,22 @@ class OrbitDatabaseHelper(context: Context) :
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_conversations_updated ON ai_conversations(updated_at_utc DESC);")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_messages_conv ON ai_messages(conversation_id, timestamp_utc ASC);")
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_tool_activities_call ON ai_tool_activities(message_id, tool_call_id);")
+
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS ai_pending_ops (
+                op_id TEXT PRIMARY KEY NOT NULL,
+                conversation_id TEXT NOT NULL,
+                op_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_error TEXT
+            );
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_ai_pending_ops_conv ON ai_pending_ops(conversation_id, created_at_ms ASC);")
     }
 
     override fun onOpen(db: SQLiteDatabase) {
@@ -281,6 +298,22 @@ class OrbitDatabaseHelper(context: Context) :
             } finally {
                 db.endTransaction()
             }
+            conversationChangeTrigger.tryEmit(Unit)
+            Unit
+        }
+
+        override suspend fun updateConversationTitle(
+            id: String,
+            title: String,
+            updatedAtUtc: Long,
+            isSynced: Boolean
+        ) = withContext(Dispatchers.IO) {
+            val values = ContentValues().apply {
+                put("title", title)
+                put("updated_at_utc", updatedAtUtc)
+                put("is_synced", if (isSynced) 1 else 0)
+            }
+            writableDatabase.update("ai_conversations", values, "id = ?", arrayOf(id))
             conversationChangeTrigger.tryEmit(Unit)
             Unit
         }
@@ -484,6 +517,127 @@ class OrbitDatabaseHelper(context: Context) :
                 put("timestamp_utc", activity.timestampUtc)
             }
             writableDatabase.insertWithOnConflict("ai_tool_activities", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+            Unit
+        }
+
+        override suspend fun enqueuePendingOp(op: AiPendingOpEntity) = withContext(Dispatchers.IO) {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                // Tombstone safety: a pending delete supersedes any prior create/rename for the same conversation,
+                // and a rename cannot be queued after a delete tombstone.
+                val hasDeleteCursor = db.rawQuery(
+                    "SELECT 1 FROM ai_pending_ops WHERE conversation_id = ? AND op_type = ? LIMIT 1",
+                    arrayOf(op.conversationId, AiPendingOpEntity.OP_DELETE)
+                )
+                val hasPendingDelete = hasDeleteCursor.use { it.moveToFirst() }
+                if (hasPendingDelete && op.opType != AiPendingOpEntity.OP_DELETE) {
+                    db.setTransactionSuccessful()
+                    return@withContext
+                }
+
+                if (op.opType == AiPendingOpEntity.OP_DELETE) {
+                    db.delete(
+                        "ai_pending_ops",
+                        "conversation_id = ? AND op_type IN (?, ?)",
+                        arrayOf(op.conversationId, AiPendingOpEntity.OP_CREATE, AiPendingOpEntity.OP_RENAME)
+                    )
+                } else if (op.opType == AiPendingOpEntity.OP_RENAME) {
+                    // Coalesce older pending renames for the same conversation
+                    db.delete(
+                        "ai_pending_ops",
+                        "conversation_id = ? AND op_type = ? AND status = ?",
+                        arrayOf(op.conversationId, AiPendingOpEntity.OP_RENAME, AiPendingOpEntity.STATUS_PENDING)
+                    )
+                }
+
+                val values = ContentValues().apply {
+                    put("op_id", op.opId)
+                    put("conversation_id", op.conversationId)
+                    put("op_type", op.opType)
+                    put("payload_json", op.payloadJson)
+                    put("created_at_ms", op.createdAtMs)
+                    put("retry_count", op.retryCount)
+                    put("status", op.status)
+                    put("last_error", op.lastError)
+                }
+                db.insertWithOnConflict("ai_pending_ops", null, values, SQLiteDatabase.CONFLICT_REPLACE)
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            Unit
+        }
+
+        override suspend fun getPendingOps(): List<AiPendingOpEntity> = withContext(Dispatchers.IO) {
+            val list = mutableListOf<AiPendingOpEntity>()
+            val cursor = readableDatabase.query(
+                "ai_pending_ops",
+                null,
+                "status != ?",
+                arrayOf(AiPendingOpEntity.STATUS_FAILED_PERMANENT),
+                null,
+                null,
+                "created_at_ms ASC"
+            )
+            cursor.use {
+                val opIdIdx = it.getColumnIndexOrThrow("op_id")
+                val convIdx = it.getColumnIndexOrThrow("conversation_id")
+                val typeIdx = it.getColumnIndexOrThrow("op_type")
+                val payloadIdx = it.getColumnIndexOrThrow("payload_json")
+                val createdIdx = it.getColumnIndexOrThrow("created_at_ms")
+                val retryIdx = it.getColumnIndexOrThrow("retry_count")
+                val statusIdx = it.getColumnIndexOrThrow("status")
+                val errIdx = it.getColumnIndexOrThrow("last_error")
+
+                while (it.moveToNext()) {
+                    list.add(
+                        AiPendingOpEntity(
+                            opId = it.getString(opIdIdx),
+                            conversationId = it.getString(convIdx),
+                            opType = it.getString(typeIdx),
+                            payloadJson = it.getString(payloadIdx),
+                            createdAtMs = it.getLong(createdIdx),
+                            retryCount = it.getInt(retryIdx),
+                            status = it.getString(statusIdx),
+                            lastError = if (it.isNull(errIdx)) null else it.getString(errIdx)
+                        )
+                    )
+                }
+            }
+            list
+        }
+
+        override suspend fun updatePendingOpStatus(
+            opId: String,
+            status: String,
+            retryCount: Int,
+            lastError: String?
+        ) = withContext(Dispatchers.IO) {
+            val values = ContentValues().apply {
+                put("status", status)
+                put("retry_count", retryCount)
+                put("last_error", lastError)
+            }
+            writableDatabase.update("ai_pending_ops", values, "op_id = ?", arrayOf(opId))
+            Unit
+        }
+
+        override suspend fun deletePendingOp(opId: String) = withContext(Dispatchers.IO) {
+            writableDatabase.delete("ai_pending_ops", "op_id = ?", arrayOf(opId))
+            Unit
+        }
+
+        override suspend fun resetInFlightPendingOps() = withContext(Dispatchers.IO) {
+            val values = ContentValues().apply {
+                put("status", AiPendingOpEntity.STATUS_PENDING)
+            }
+            writableDatabase.update(
+                "ai_pending_ops",
+                values,
+                "status = ?",
+                arrayOf(AiPendingOpEntity.STATUS_IN_FLIGHT)
+            )
             Unit
         }
     }

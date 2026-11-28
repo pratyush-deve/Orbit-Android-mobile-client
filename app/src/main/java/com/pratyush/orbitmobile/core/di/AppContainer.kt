@@ -156,10 +156,33 @@ class DefaultAppContainer(private val appContext: Context) : AppContainer {
         com.pratyush.orbitmobile.data.local.database.OrbitDatabaseHelper.getInstance(appContext)
     }
 
+    val lanAiTransport: com.pratyush.orbitmobile.domain.repository.AiTransport by lazy {
+        com.pratyush.orbitmobile.data.remote.ai.LanAiTransport(
+            connectionRepository = connectionRepository
+        )
+    }
+
+    val firebaseAiTransport: com.pratyush.orbitmobile.domain.repository.AiTransport by lazy {
+        com.pratyush.orbitmobile.data.remote.ai.FirebaseAiTransport(
+            firebaseRemoteClient = firebaseRemoteClient,
+            linkStore = remoteLinkStore
+        )
+    }
+
+    val aiTransport: com.pratyush.orbitmobile.domain.repository.AiTransport by lazy {
+        com.pratyush.orbitmobile.data.remote.ai.RoutingAiTransport(
+            connectionRepository = connectionRepository,
+            remoteLinkStore = remoteLinkStore,
+            firebasePresenceManager = firebasePresenceManager,
+            lanTransport = lanAiTransport,
+            firebaseTransport = firebaseAiTransport
+        )
+    }
+
     override val aiChatRepository: com.pratyush.orbitmobile.domain.repository.AiChatRepository by lazy {
         com.pratyush.orbitmobile.data.repository.implementations.AiChatRepositoryImpl(
             connectionRepository = connectionRepository,
-            remoteDataSource = remoteDataSource,
+            aiTransport = aiTransport,
             database = database
         )
     }

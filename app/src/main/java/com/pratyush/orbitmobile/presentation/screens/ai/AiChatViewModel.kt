@@ -91,6 +91,15 @@ class AiChatViewModel(
         }
     }
 
+    fun renameConversation(conversationId: String, newTitle: String) {
+        viewModelScope.launch {
+            val result = aiChatRepository.renameConversation(conversationId, newTitle)
+            if (result is OrbitResult.Error) {
+                _uiState.update { it.copy(errorMessage = result.message) }
+            }
+        }
+    }
+
     fun deleteConversation(conversationId: String) {
         viewModelScope.launch {
             val result = aiChatRepository.deleteConversation(conversationId)
